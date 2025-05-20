@@ -1,0 +1,5 @@
+SQLAlchemy>=1.4
+psycopg2-binary
+pandas~=2.2.3
+faker~=37.3.0
+tqdm~=4.67.1
