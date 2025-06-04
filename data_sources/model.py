@@ -1,108 +1,129 @@
+#!/usr/bin/env python3
+# create_source_tables.py
+
+"""
+This script mirrors the “warehouse” schema structure into a “source” schema.
+All table/column names, data types, and constraints are kept identical,
+but point to “source” instead of “warehouse” so we can ingest raw data
+before any transformations.
+
+References:
+- SQLAlchemy Table and Column docs:
+  https://docs.sqlalchemy.org/en/14/core/metadata.html#sqlalchemy.schema.Table
+- SQLAlchemy ForeignKey docs:
+  https://docs.sqlalchemy.org/en/14/core/constraints.html#sqlalchemy.schema.ForeignKey
+"""
+
 from sqlalchemy import (
-    Column, Integer, String, Text, DateTime,
-    ForeignKey, CheckConstraint
+    create_engine,
+    MetaData,
+    Table,
+    Column,
+    Integer,
+    String,
+    Text,
+    DateTime,
+    ForeignKey,
+    CheckConstraint,
+    PrimaryKeyConstraint,
+    text
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship
 import datetime
 
-Base = declarative_base()
+# ───────────── 1) DATABASE URL ─────────────────────────────────────────────────
+DATABASE_URL = "postgresql+psycopg2://postgres:admin@localhost:5432/bi_project"
 
-class User(Base):
-    __tablename__ = 'users'
-    user_id       = Column(Integer, primary_key=True)
-    first_name    = Column(String(100), nullable=False)
-    last_name     = Column(String(100), nullable=False)
-    email         = Column(String(255), nullable=False, unique=True)
-    phone         = Column(String(20))
-    registered_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+# ───────────── 2) CREATE ENGINE & ENSURE “source” SCHEMA ───────────────────────
+engine = create_engine(DATABASE_URL, echo=True)
 
-    enrollments   = relationship("Enrollment", back_populates="user")
-    traffic       = relationship("UserTraffic", back_populates="user")
+with engine.begin() as conn:
+    # If the “source” schema does not exist, create it
+    conn.execute(text("CREATE SCHEMA IF NOT EXISTS source"))
 
+# ───────────── 3) ATTACH METADATA TO “source” SCHEMA ──────────────────────────
+metadata = MetaData(schema="source")
 
-class SalesManager(Base):
-    __tablename__ = 'sales_managers'
-    manager_id = Column(Integer, primary_key=True)
-    first_name = Column(String(100), nullable=False)
-    last_name  = Column(String(100), nullable=False)
-    email      = Column(String(255), nullable=False, unique=True)
-    hired_at   = Column(DateTime, nullable=False)
+# ───────────── 4) DEFINE SOURCE TABLES (mirror of warehouse) ──────────────────
 
-    sales      = relationship("Sale", back_populates="manager")
+# 4.1) users table in source
+source_users = Table(
+    "users", metadata,
+    Column("user_id",       Integer, primary_key=True),
+    Column("first_name",    String(100),  nullable=False),
+    Column("last_name",     String(100),  nullable=False),
+    Column("email",         String(255),  nullable=False, unique=True),
+    Column("phone",         String(20)),
+    Column("registered_at", DateTime,     nullable=False, default=datetime.datetime.utcnow),
+)
 
+# 4.2) sales_managers table in source
+source_sales_managers = Table(
+    "sales_managers", metadata,
+    Column("manager_id", Integer, primary_key=True),
+    Column("first_name", String(100), nullable=False),
+    Column("last_name",  String(100), nullable=False),
+    Column("email",      String(255), nullable=False, unique=True),
+    Column("hired_at",   DateTime,    nullable=False),
+)
 
-class Course(Base):
-    __tablename__ = 'courses'
-    course_id   = Column(Integer, primary_key=True)
-    title       = Column(String(255), nullable=False)
-    subject     = Column(String(100), nullable=False)
-    description = Column(Text)
-    price_cents = Column(Integer, nullable=False)
-    created_at  = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+# 4.3) courses table in source
+source_courses = Table(
+    "courses", metadata,
+    Column("course_id",   Integer, primary_key=True),
+    Column("title",       String(255), nullable=False),
+    Column("subject",     String(100), nullable=False),
+    Column("description", Text),
+    Column("price_in_rubbles", Integer, nullable=False),
+    Column("created_at",  DateTime, nullable=False, default=datetime.datetime.utcnow),
+    CheckConstraint("price_in_rubbles >= 0", name="price_in_rubbles_non_negative"),
+)
 
-    __table_args__ = (
-        CheckConstraint('price_cents >= 0', name='price_non_negative'),
-    )
+# 4.4) enrollments table in source
+source_enrollments = Table(
+    "enrollments", metadata,
+    Column("enrollment_id", Integer, primary_key=True),
+    # Note: ForeignKey points to source.users.user_id, not warehouse
+    Column("user_id",       Integer, ForeignKey("source.users.user_id"),   nullable=False),
+    Column("course_id",     Integer, ForeignKey("source.courses.course_id"), nullable=False),
+    Column("enrolled_at",   DateTime, nullable=False, default=datetime.datetime.utcnow),
+    Column("status", String(20), nullable=False),
+    CheckConstraint(
+        "status IN ('active','completed','cancelled')",
+        name="valid_status"
+    ),
+)
 
-    enrollments = relationship("Enrollment", back_populates="course")
+# 4.5) sales table in source
+source_sales = Table(
+    "sales", metadata,
+    Column("sale_id",       Integer, primary_key=True),
+    Column("enrollment_id", Integer, ForeignKey("source.enrollments.enrollment_id"), nullable=False, unique=True),
+    Column("manager_id",    Integer, nullable=False),
+    Column("sale_date",     DateTime, nullable=False, default=datetime.datetime.utcnow),
+    Column("cost_in_rubbles", Integer,  nullable=False),
+    CheckConstraint("cost_in_rubbles >= 0", name="cost_in_rubbles_non_negative"),
+)
 
+# 4.6) traffic_sources table in source
+source_traffic_sources = Table(
+    "traffic_sources", metadata,
+    Column("source_id", Integer, primary_key=True),
+    Column("name",      String(100), nullable=False),
+    Column("channel",   String(100), nullable=False),
+    Column("details",   Text),
+)
 
-class Enrollment(Base):
-    __tablename__ = 'enrollments'
+# 4.7) user_traffic table in source
+source_user_traffic = Table(
+    "user_traffic", metadata,
+    Column("user_id",       Integer, ForeignKey("source.users.user_id"),   nullable=False),
+    Column("source_id",     Integer, ForeignKey("source.traffic_sources.source_id"), nullable=False),
+    Column("referred_at",   DateTime, nullable=False, default=datetime.datetime.utcnow),
+    Column("campaign_code", String(50)),
+    PrimaryKeyConstraint("user_id", "source_id", "referred_at", name="pk_user_traffic"),
+)
 
-    enrollment_id = Column(Integer, primary_key=True)
-    user_id       = Column(Integer, ForeignKey('users.user_id'), nullable=False)
-    course_id     = Column(Integer, ForeignKey('courses.course_id'), nullable=False)
-    enrolled_at   = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-
-    status = Column(
-        String(20),
-        CheckConstraint(
-            "status IN ('active','completed','cancelled')",
-            name='valid_status'
-        ),
-        nullable=False
-    )
-
-    user   = relationship("User", back_populates="enrollments")
-    course = relationship("Course", back_populates="enrollments")
-    sale   = relationship("Sale", back_populates="enrollment", uselist=False)
-
-
-
-class Sale(Base):
-    __tablename__ = 'sales'
-    sale_id       = Column(Integer, primary_key=True)
-    enrollment_id = Column(Integer, ForeignKey('enrollments.enrollment_id'), nullable=False, unique=True)
-    manager_id    = Column(Integer, ForeignKey('sales_managers.manager_id'), nullable=False)
-    sale_date     = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    cost_in_rubbles  = Column(Integer, nullable=False)
-
-    __table_args__ = (
-        CheckConstraint('cost_in_rubbles >= 0', name='amount_non_negative'),
-    )
-
-    enrollment = relationship("Enrollment", back_populates="sale")
-    manager    = relationship("SalesManager", back_populates="sales")
-
-
-class TrafficSource(Base):
-    __tablename__ = 'traffic_sources'
-    source_id = Column(Integer, primary_key=True)
-    name      = Column(String(100), nullable=False)   # e.g. 'Telegram', 'VK'
-    channel   = Column(String(100), nullable=False)   # e.g. 'social', 'ads'
-    details   = Column(Text)
-
-    referrals = relationship("UserTraffic", back_populates="source")
-
-
-class UserTraffic(Base):
-    __tablename__ = 'user_traffic'
-    user_id       = Column(Integer, ForeignKey('users.user_id'),   primary_key=True)
-    source_id     = Column(Integer, ForeignKey('traffic_sources.source_id'), primary_key=True)
-    referred_at   = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, primary_key=True)
-    campaign_code = Column(String(50))
-
-    user   = relationship("User", back_populates="traffic")
-    source = relationship("TrafficSource", back_populates="referrals")
+# ───────────── 5) CREATE ALL SOURCE TABLES AT ONCE ─────────────────────────────
+if __name__ == "__main__":
+    metadata.create_all(engine)
+    print("✅ All source tables created successfully.")
