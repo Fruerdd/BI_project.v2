@@ -1,15 +1,12 @@
-# ────────────────────────────────────────────────────────────────────────────────
-# populate_db.py
-# (unchanged; all source tables already have primary keys)
-# ────────────────────────────────────────────────────────────────────────────────
-
 #!/usr/bin/env python3
 # populate_db.py
 
 """
 Populate data into the `source` schema (rather than the default “public”).
 Below are the necessary changes to ensure every table and foreign key
-points at `source.<table>` instead of `public.<table>`.
+points at `source.<table>` instead of `public.<table>`. The only change
+needed to fix the `ObjectNotExecutableError` is to wrap raw SQL in
+`sqlalchemy.text()` before passing it to `conn.execute()`.
 """
 
 from sqlalchemy import (
@@ -21,6 +18,7 @@ from sqlalchemy import (
     ForeignKey,
     CheckConstraint,
     create_engine,
+    text,               # <-- import text() for raw SQL execution
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
@@ -33,12 +31,14 @@ from uuid import uuid4
 # ─────────── 0) ENSURE “source” SCHEMA EXISTS ──────────────────────────────────
 DATABASE_URL = "postgresql+psycopg2://postgres:admin@localhost:5432/bi_project"
 engine = create_engine(DATABASE_URL, echo=True)
+
 with engine.begin() as conn:
-    conn.execute("CREATE SCHEMA IF NOT EXISTS source")
+    # In SQLAlchemy 2.x, conn.execute() no longer accepts plain strings.
+    # Wrap raw SQL in text(...) to produce a TextClause.
+    conn.execute(text("CREATE SCHEMA IF NOT EXISTS source"))
 
 # ─────────── 1) DECLARATIVE BASE + SCHEMA CONFIG ──────────────────────────────
-Base = declarative_base(metadata=None)
-
+Base = declarative_base()  # no need for metadata=None here
 
 class User(Base):
     __tablename__  = "users"
@@ -49,7 +49,9 @@ class User(Base):
     last_name     = Column(String(100), nullable=False)
     email         = Column(String(255), nullable=False, unique=True)
     phone         = Column(String(20))
-    registered_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    registered_at = Column(
+        DateTime, default=datetime.datetime.utcnow, nullable=False
+    )
 
     enrollments   = relationship("Enrollment", back_populates="user")
     traffic       = relationship("UserTraffic", back_populates="user")
@@ -71,8 +73,10 @@ class SalesManager(Base):
 class Course(Base):
     __tablename__  = "courses"
     __table_args__ = (
-        CheckConstraint("price_in_rubbles >= 0", name="price_in_rubbles_non_negative"),
-        {"schema": "source"}
+        CheckConstraint(
+            "price_in_rubbles >= 0", name="price_in_rubbles_non_negative"
+        ),
+        {"schema": "source"},
     )
 
     course_id        = Column(Integer, primary_key=True)
@@ -80,7 +84,9 @@ class Course(Base):
     subject          = Column(String(100), nullable=False)
     description      = Column(Text)
     price_in_rubbles = Column(Integer, nullable=False)
-    created_at       = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    created_at       = Column(
+        DateTime, default=datetime.datetime.utcnow, nullable=False
+    )
 
     enrollments = relationship("Enrollment", back_populates="course")
 
@@ -92,15 +98,18 @@ class Enrollment(Base):
             "status IN ('active','completed','cancelled')",
             name="valid_status"
         ),
-        {"schema": "source"}
+        {"schema": "source"},
     )
 
     enrollment_id = Column(Integer, primary_key=True)
-    user_id       = Column(Integer, ForeignKey("source.users.user_id"), nullable=False)
-    course_id     = Column(Integer, ForeignKey("source.courses.course_id"), nullable=False)
+    user_id       = Column(
+        Integer, ForeignKey("source.users.user_id"), nullable=False
+    )
+    course_id     = Column(
+        Integer, ForeignKey("source.courses.course_id"), nullable=False
+    )
     enrolled_at   = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-
-    status = Column(String(20), nullable=False)
+    status        = Column(String(20), nullable=False)
 
     user   = relationship("User", back_populates="enrollments")
     course = relationship("Course", back_populates="enrollments")
@@ -110,13 +119,19 @@ class Enrollment(Base):
 class Sale(Base):
     __tablename__  = "sales"
     __table_args__ = (
-        CheckConstraint("cost_in_rubbles >= 0", name="cost_in_rubbles_non_negative"),
-        {"schema": "source"}
+        CheckConstraint(
+            "cost_in_rubbles >= 0", name="cost_in_rubbles_non_negative"
+        ),
+        {"schema": "source"},
     )
 
     sale_id          = Column(Integer, primary_key=True)
-    enrollment_id    = Column(Integer, ForeignKey("source.enrollments.enrollment_id"), nullable=False, unique=True)
-    manager_id       = Column(Integer, ForeignKey("source.sales_managers.manager_id"), nullable=False)
+    enrollment_id    = Column(
+        Integer, ForeignKey("source.enrollments.enrollment_id"), nullable=False, unique=True
+    )
+    manager_id       = Column(
+        Integer, ForeignKey("source.sales_managers.manager_id"), nullable=False
+    )
     sale_date        = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     cost_in_rubbles  = Column(Integer, nullable=False)
 
@@ -150,7 +165,6 @@ class UserTraffic(Base):
 
 
 # ─────────── 2) SEEDING LOGIC ───────────────────────────────────────────────────
-
 Session = sessionmaker(bind=engine)
 session = Session()
 fake    = Faker()
@@ -159,7 +173,6 @@ fake    = Faker()
 Base.metadata.create_all(engine)
 
 # ─── 3) Traffic sources ────────────────────────────────────────────────────────
-
 traffic_list = [
     ("University Ads",   "ads"),
     ("Telegram Channel", "social"),
@@ -185,8 +198,7 @@ session.commit()
 all_sources = session.query(TrafficSource).all()
 
 # ─── 4) Users + user_traffic ───────────────────────────────────────────────────
-
-USER_COUNT = 1_000_000
+USER_COUNT = 100000
 BATCH_SIZE = 10_000
 
 for _ in trange(0, USER_COUNT, BATCH_SIZE, desc="Users"):
@@ -228,7 +240,6 @@ for _ in trange(0, USER_COUNT, BATCH_SIZE, desc="Users"):
     session.commit()
 
 # ─── 5) Courses ────────────────────────────────────────────────────────────────
-
 for _ in range(100):
     session.add(
         Course(
@@ -243,7 +254,6 @@ session.commit()
 all_course_ids = [cid for (cid,) in session.query(Course.course_id).all()]
 
 # ─── 6) Sales Managers ─────────────────────────────────────────────────────────
-
 for _ in range(100):
     session.add(
         SalesManager(
@@ -257,8 +267,7 @@ session.commit()
 all_manager_ids = [mid for (mid,) in session.query(SalesManager.manager_id).all()]
 
 # ─── 7) Enrollments + Sales ────────────────────────────────────────────────────
-
-SALE_COUNT     = 321_584
+SALE_COUNT     = 95124
 inserted_sales = 0
 all_user_ids   = [uid for (uid,) in session.query(User.user_id).all()]
 

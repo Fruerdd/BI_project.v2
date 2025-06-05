@@ -9,16 +9,21 @@ Usage:
 
   # Incremental load (pass the next batch_id, e.g. 2, 3, …)
   python etl.py inc 2
+
+This script performs a Slowly Changing Dimension (SCD2) load into a “warehouse” schema,
+then builds a star‐schema (dim_user, dim_course, dim_traffic_source, dim_sales_manager, dim_date, fact_sales).
+Key change: each dim table’s surrogate key (user_key, course_key, etc.) is explicitly set to the warehouse SCD2 surrogate (user_sk, course_sk, etc.),
+so that fact_sales can join on those same surrogates and actually produce rows.
 """
 
 import sys
 import datetime
-import time
+import pytz
 from sqlalchemy import create_engine, text
 
 # ───────────── Configuration ───────────────────────────────────────────────────
 DB_URL   = "postgresql+psycopg2://postgres:admin@localhost:5432/bi_project"
-SRC_MAIN = 1   # arbitrary source_id for audit (e.g. “the main source is ID=1”)
+SRC_MAIN = 1   # arbitrary source_id for audit
 
 # ───────────── Engines ───────────────────────────────────────────────────────────
 source_engine    = create_engine(DB_URL, echo=False)
@@ -26,19 +31,11 @@ warehouse_engine = create_engine(DB_URL, echo=False)
 
 
 def run_full_load():
-    """
-    This does a “FULL” load:
-      1) TRUNCATE everything in warehouse.* + star_schema.*
-      2) Load all warehouse tables from source.*
-      3) Build ALL star_schema dims: dim_user, dim_course, dim_traffic_source, dim_sales_manager, dim_date
-      4) Populate star_schema.fact_sales via the correct FK joins
-    """
     batch_id = 1
-    # Always use a timezone-aware UTC timestamp in logs
-    now_ts = datetime.datetime.now(datetime.timezone.utc)
+    now_ts = datetime.datetime.now(pytz.UTC)
     print(f"[{now_ts}] ▶️  Starting FULL load (batch_id={batch_id})\n")
 
-    # ─── 1) TRUNCATE all warehouse.*/star_schema.* ───────────────────────────────────
+    # ─── 1) TRUNCATE all warehouse + star_schema tables in one short transaction ───
     with warehouse_engine.begin() as conn:
         conn.execute(text("TRUNCATE TABLE warehouse.user_traffic        CASCADE"))
         conn.execute(text("TRUNCATE TABLE warehouse.traffic_sources    CASCADE"))
@@ -54,10 +51,14 @@ def run_full_load():
         conn.execute(text("TRUNCATE TABLE star_schema.dim_course         CASCADE"))
         conn.execute(text("TRUNCATE TABLE star_schema.dim_user           CASCADE"))
         conn.execute(text("TRUNCATE TABLE star_schema.dim_sales_manager  CASCADE"))
+    print("   • truncated all warehouse + star_schema tables\n")
 
-    # ─── 2) Load ALL “warehouse” tables from “source” ─────────────────────────────────
+    # ───────────────────────────────────────────────────────────────────────────────
+    # 2) Populate each warehouse table in its own transaction (to release locks quickly)
+    # ───────────────────────────────────────────────────────────────────────────────
+
+    # 2.1) USERS → warehouse.users (SCD2 full)
     with warehouse_engine.begin() as conn:
-        # 2.1) USERS → warehouse.users
         conn.execute(text("""
             INSERT INTO warehouse.users
               (user_id, first_name, last_name, email, phone, registered_at,
@@ -76,9 +77,10 @@ def run_full_load():
               NULL                AS update_id
             FROM source.users AS u;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • loaded warehouse.users")
+    print("   • loaded warehouse.users")
 
-        # 2.2) SALES_MANAGERS → warehouse.sales_managers
+    # 2.2) SALES_MANAGERS → warehouse.sales_managers (SCD2 full)
+    with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO warehouse.sales_managers
               (manager_id, first_name, last_name, email, hired_at,
@@ -96,9 +98,10 @@ def run_full_load():
               NULL                AS update_id
             FROM source.sales_managers AS m;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • loaded warehouse.sales_managers")
+    print("   • loaded warehouse.sales_managers")
 
-        # 2.3) COURSES → warehouse.courses
+    # 2.3) COURSES → warehouse.courses (SCD2 full)
+    with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO warehouse.courses
               (course_id, title, subject, description, price_in_rubbles, created_at,
@@ -117,10 +120,10 @@ def run_full_load():
               NULL                AS update_id
             FROM source.courses AS c;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • loaded warehouse.courses")
+    print("   • loaded warehouse.courses")
 
-        # 2.4) ENROLLMENTS → warehouse.enrollments
-        #     We look up the current user_sk & course_sk from active rows (end_date = '9999-12-31')
+    # 2.4) ENROLLMENTS → warehouse.enrollments (SCD2 full)
+    with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO warehouse.enrollments
               (enrollment_id, user_sk, course_sk, enrolled_at, status,
@@ -144,10 +147,10 @@ def run_full_load():
               ON e.course_id = c.course_id
              AND c.end_date = '9999-12-31'::DATE;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • loaded warehouse.enrollments")
+    print("   • loaded warehouse.enrollments")
 
-        # 2.5) SALES → warehouse.sales
-        #     We look up enrollment_sk & sales_manager_sk from active rows
+    # 2.5) SALES → warehouse.sales (SCD2 full)
+    with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO warehouse.sales
               (sale_id, enrollment_sk, sales_manager_sk, sale_date, cost_in_rubbles,
@@ -171,9 +174,10 @@ def run_full_load():
               ON s.manager_id = m.manager_id
              AND m.end_date = '9999-12-31'::DATE;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • loaded warehouse.sales")
+    print("   • loaded warehouse.sales")
 
-        # 2.6) TRAFFIC_SOURCES → warehouse.traffic_sources
+    # 2.6) TRAFFIC_SOURCES → warehouse.traffic_sources (SCD2 full)
+    with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO warehouse.traffic_sources
               (source_id, name, channel, details,
@@ -190,10 +194,10 @@ def run_full_load():
               NULL                AS update_id
             FROM source.traffic_sources AS t;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • loaded warehouse.traffic_sources")
+    print("   • loaded warehouse.traffic_sources")
 
-        # 2.7) USER_TRAFFIC → warehouse.user_traffic
-        #     Join on user_sk & traffic_source_sk
+    # 2.7) USER_TRAFFIC → warehouse.user_traffic (SCD2 full)
+    with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO warehouse.user_traffic
               (user_sk, traffic_source_sk, referred_at, campaign_code,
@@ -216,32 +220,36 @@ def run_full_load():
               ON ut.source_id = t.source_id
              AND t.end_date = '9999-12-31'::DATE;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • loaded warehouse.user_traffic\n")
+    print("   • loaded warehouse.user_traffic\n")
 
-    # ─── 3) Build “star_schema” dims ───────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────────────────────
+    # 3) Build “star_schema” dims & fact, each in its own transaction
+    # ───────────────────────────────────────────────────────────────────────────────
+
+    # 3.1) dim_user: explicitly assign warehouse.user_sk → dim_user.user_key
     with warehouse_engine.begin() as conn:
-        # 3.1) dim_user
         conn.execute(text("""
-            DELETE FROM star_schema.dim_user;
             INSERT INTO star_schema.dim_user
-              (user_id, first_name, last_name, email, signup_date)
+              (user_key, user_id, first_name, last_name, email, signup_date)
             SELECT
-              w.user_id,
-              w.first_name,
-              w.last_name,
-              w.email,
-              w.registered_at::DATE AS signup_date
-            FROM warehouse.users AS w
-            WHERE w.end_date = '9999-12-31'::DATE;
+              u.user_sk    AS user_key,
+              u.user_id,
+              u.first_name,
+              u.last_name,
+              u.email,
+              u.registered_at::DATE AS signup_date
+            FROM warehouse.users AS u
+            WHERE u.end_date = '9999-12-31'::DATE;
         """))
-        print("   • loaded star_schema.dim_user")
+    print("   • loaded star_schema.dim_user")
 
-        # 3.2) dim_course
-        conn.execute(text("DELETE FROM star_schema.dim_course;"))
+    # 3.2) dim_course: assign warehouse.course_sk → dim_course.course_key
+    with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO star_schema.dim_course
-              (course_id, title, subject, price_in_rubbles)
+              (course_key, course_id, title, subject, price_in_rubbles)
             SELECT
+              c.course_sk    AS course_key,
               c.course_id,
               c.title,
               c.subject,
@@ -249,133 +257,137 @@ def run_full_load():
             FROM warehouse.courses AS c
             WHERE c.end_date = '9999-12-31'::DATE;
         """))
-        rows_loaded = conn.execute(text("""
-            SELECT COUNT(*) 
-            FROM warehouse.courses
-            WHERE end_date = '9999-12-31'::DATE;
-        """)).scalar_one()
-        print(f"   • loaded star_schema.dim_course ({rows_loaded} rows)")
+    print("   • loaded star_schema.dim_course")
 
-        # 3.3) dim_traffic_source
+    # 3.3) dim_traffic_source: assign warehouse.traffic_source_sk → dim_traffic_source.traffic_source_key
+    with warehouse_engine.begin() as conn:
         conn.execute(text("""
-            DELETE FROM star_schema.dim_traffic_source;
             INSERT INTO star_schema.dim_traffic_source
-              (traffic_source_id, name, channel)
+              (traffic_source_key, traffic_source_id, name, channel)
             SELECT
-              t.source_id      AS traffic_source_id,
+              t.traffic_source_sk    AS traffic_source_key,
+              t.source_id            AS traffic_source_id,
               t.name,
               t.channel
             FROM warehouse.traffic_sources AS t
             WHERE t.end_date = '9999-12-31'::DATE;
         """))
-        print("   • loaded star_schema.dim_traffic_source")
+    print("   • loaded star_schema.dim_traffic_source")
 
-        # 3.4) dim_sales_manager
+    # 3.4) dim_sales_manager: assign warehouse.sales_manager_sk → dim_sales_manager.sales_manager_key
+    with warehouse_engine.begin() as conn:
         conn.execute(text("""
-            DELETE FROM star_schema.dim_sales_manager;
             INSERT INTO star_schema.dim_sales_manager
-              (manager_id, first_name, last_name, email, hired_at)
+              (sales_manager_key, manager_id, first_name, last_name, email, hired_at)
             SELECT
+              m.sales_manager_sk    AS sales_manager_key,
               m.manager_id,
               m.first_name,
               m.last_name,
               m.email,
-              m.hired_at
+              m.hired_at::DATE
             FROM warehouse.sales_managers AS m
             WHERE m.end_date = '9999-12-31'::DATE;
         """))
-        print("   • loaded star_schema.dim_sales_manager")
+    print("   • loaded star_schema.dim_sales_manager")
 
-        # 3.5) dim_date
-        #     If there are any sales at all, grab MIN/MAX dates from warehouse.sales
-        conn.execute(text("DELETE FROM star_schema.dim_date;"))
+    # 3.5) dim_date – compute per‐table min/max separately (no Cartesian join)
+    with warehouse_engine.begin() as conn:
         result = conn.execute(text("""
-            SELECT MIN(sale_date)::DATE AS min_d, MAX(sale_date)::DATE AS max_d
-            FROM warehouse.sales;
+            SELECT
+              (SELECT MIN(registered_at)::DATE     FROM warehouse.users      ) AS min_u,
+              (SELECT MIN(created_at)::DATE        FROM warehouse.courses    ) AS min_c,
+              (SELECT MIN(enrolled_at)::DATE       FROM warehouse.enrollments) AS min_e,
+              (SELECT MIN(sale_date)::DATE         FROM warehouse.sales       ) AS min_s,
+              (SELECT MIN(referred_at)::DATE       FROM warehouse.user_traffic) AS min_ut,
+
+              (SELECT MAX(registered_at)::DATE     FROM warehouse.users      ) AS max_u,
+              (SELECT MAX(created_at)::DATE        FROM warehouse.courses    ) AS max_c,
+              (SELECT MAX(enrolled_at)::DATE       FROM warehouse.enrollments) AS max_e,
+              (SELECT MAX(sale_date)::DATE         FROM warehouse.sales       ) AS max_s,
+              (SELECT MAX(referred_at)::DATE       FROM warehouse.user_traffic) AS max_ut
         """)).mappings().one()
 
-        min_date = result["min_d"]
-        max_date = result["max_d"]
-        if min_date is not None and max_date is not None:
-            conn.execute(text(f"""
-                INSERT INTO star_schema.dim_date
-                  (date, year, quarter, month, day, weekday)
-                SELECT
-                  gs::DATE            AS date,
-                  EXTRACT(YEAR FROM gs)::INT   AS year,
-                  EXTRACT(QUARTER FROM gs)::INT AS quarter,
-                  EXTRACT(MONTH FROM gs)::INT   AS month,
-                  EXTRACT(DAY FROM gs)::INT     AS day,
-                  EXTRACT(DOW FROM gs)::INT     AS weekday
-                FROM generate_series(
-                  '{min_date}'::DATE,
-                  '{max_date}'::DATE,
-                  '1 day'::INTERVAL
-                ) AS gs;
-            """))
-            total_days = (max_date - min_date).days + 1
-            print(f"   • loaded star_schema.dim_date ({total_days} days)")
-        else:
-            print("   • no sales dates found; skipped dim_date load")
+    min_candidates = [
+        result["min_u"],
+        result["min_c"],
+        result["min_e"],
+        result["min_s"],
+        result["min_ut"]
+    ]
+    max_candidates = [
+        result["max_u"],
+        result["max_c"],
+        result["max_e"],
+        result["max_s"],
+        result["max_ut"]
+    ]
 
-    # ─── 4) Populate star_schema.fact_sales ───────────────────────────────────────────
+    min_date = min([d for d in min_candidates if d is not None], default=datetime.date.today())
+    max_date = max([d for d in max_candidates if d is not None], default=datetime.date.today())
+
     with warehouse_engine.begin() as conn:
-        # 4.1) Empty fact_sales
-        conn.execute(text("DELETE FROM star_schema.fact_sales;"))
-        print("   • cleared star_schema.fact_sales")
+        conn.execute(text(f"""
+            INSERT INTO star_schema.dim_date
+              (date_key, date, year, quarter, month, day, weekday)
+            SELECT
+              TO_CHAR(gs::DATE, 'YYYYMMDD')::INT AS date_key,
+              gs::DATE                            AS date,
+              EXTRACT(YEAR   FROM gs)::INT        AS year,
+              EXTRACT(QUARTER FROM gs)::INT        AS quarter,
+              EXTRACT(MONTH  FROM gs)::INT        AS month,
+              EXTRACT(DAY    FROM gs)::INT        AS day,
+              EXTRACT(DOW    FROM gs)::INT        AS weekday
+            FROM generate_series(
+              '{min_date}'::DATE,
+              '{max_date}'::DATE,
+              '1 day'::INTERVAL
+            ) AS gs;
+        """))
+    total_days = (max_date - min_date).days + 1
+    print(f"   • loaded star_schema.dim_date ({total_days} days from {min_date} to {max_date})")
 
-        # 4.2) INSERT into fact_sales, joining to the correct dim tables (user, course,
-        #      sales_manager, traffic_source, date)
+    # 3.6) fact_sales: join on warehouse SK → dim SK so rows actually appear
+    with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO star_schema.fact_sales
-              (
-                sale_id,
-                user_key,
-                course_key,
-                sales_manager_key,
-                traffic_source_key,
-                date_key,
-                total_in_rubbles,
-                enrollment_count
-              )
+              (sale_id, user_key, course_key, sales_manager_key, traffic_source_key, date_key,
+               total_in_rubbles, enrollment_count)
             SELECT
               s.sale_id,
-              du.user_key,
-              dc.course_key,
-              dsm.sales_manager_key,
-              dts.traffic_source_key,
+              e.user_sk                   AS user_key,
+              e.course_sk                 AS course_key,
+              s.sales_manager_sk          AS sales_manager_key,
+              COALESCE(ut.traffic_source_sk, -1) AS traffic_source_key,
               dd.date_key,
-              s.cost_in_rubbles   AS total_in_rubbles,
-              1                   AS enrollment_count
-            FROM warehouse.sales AS s
-            JOIN warehouse.enrollments          AS e   ON s.enrollment_sk     = e.enrollment_sk
-            JOIN warehouse.user_traffic         AS ut  ON e.user_sk          = ut.user_sk
-                                                  AND ut.end_date       = '9999-12-31'::DATE
-            JOIN star_schema.dim_user           AS du  ON e.user_sk          = du.user_key
-            JOIN star_schema.dim_course         AS dc  ON e.course_sk        = dc.course_key
-            JOIN star_schema.dim_sales_manager  AS dsm ON s.sales_manager_sk = dsm.sales_manager_key
-            JOIN star_schema.dim_traffic_source AS dts ON ut.traffic_source_sk = dts.traffic_source_key
-            JOIN star_schema.dim_date           AS dd  ON s.sale_date::DATE  = dd.date;
+              s.cost_in_rubbles           AS total_in_rubbles,
+              1                           AS enrollment_count
+            FROM warehouse.sales s
+            JOIN warehouse.enrollments e 
+              ON s.enrollment_sk = e.enrollment_sk
+            LEFT JOIN warehouse.user_traffic ut 
+              ON e.user_sk = ut.user_sk
+             AND ut.end_date = '9999-12-31'::DATE
+            JOIN star_schema.dim_date dd 
+              ON s.sale_date::DATE = dd.date
+            WHERE s.end_date = '9999-12-31'::DATE;
         """))
-        print("   • loaded star_schema.fact_sales\n")
+    print("   • loaded star_schema.fact_sales\n")
 
-    print(f"[{datetime.datetime.now(datetime.timezone.utc)}] ✅ FULL load complete.\n")
+    print(f"[{datetime.datetime.now(pytz.UTC)}] ✅ FULL load complete.\n")
 
 
 def run_incremental_load(batch_id: int):
-    """
-    This does an “INCREMENTAL” load:
-      1) Run your SCD2 logic on warehouse.* (insert new rows, version out old rows)
-      2) TRUNCATE & rebuild star_schema dims
-      3) Truncate & repopulate star_schema.fact_sales (using the correct dim joins)
-    """
-    now_ts = datetime.datetime.now(datetime.timezone.utc)
+    now_ts = datetime.datetime.now(pytz.UTC)
     print(f"[{now_ts}] ▶️  Starting INCREMENTAL load (batch_id={batch_id})\n")
 
-    # ─── 1) SCD2 logic for warehouse.* ────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────────────────────
+    # 1) Incrementally update "warehouse" schema with SCD2 logic, one-step-per-txn
+    # ───────────────────────────────────────────────────────────────────────────────
+
+    # 1.1) USERS
     with warehouse_engine.begin() as conn:
-        # 1.1) USERS ─────────────────────────────────────────────────────────────────────
-        # 1.1.a) Insert brand‐new users
+        # 1.1.a) Insert brand-new users
         conn.execute(text("""
             INSERT INTO warehouse.users (
                 user_id, first_name, last_name, email, phone, registered_at,
@@ -399,9 +411,10 @@ def run_incremental_load(batch_id: int):
                  AND w.end_date = '9999-12-31'::DATE
             WHERE w.user_id IS NULL;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • inserted new warehouse.users")
+    print("   • inserted new warehouse.users")
 
-        # 1.1.b) For changed users, insert a new “active” row (update_id = NULL)
+    with warehouse_engine.begin() as conn:
+        # 1.1.b) Insert new versions for changed users
         conn.execute(text("""
             INSERT INTO warehouse.users (
                 user_id, first_name, last_name, email, phone, registered_at,
@@ -430,9 +443,10 @@ def run_incremental_load(batch_id: int):
               OR  s.phone         IS DISTINCT FROM w.phone
               OR  s.registered_at IS DISTINCT FROM w.registered_at;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • inserted new versions for changed warehouse.users")
+    print("   • inserted new versions for changed warehouse.users")
 
-        # 1.1.c) Close out old active user rows
+    with warehouse_engine.begin() as conn:
+        # 1.1.c) Close out old active user records
         conn.execute(text("""
             UPDATE warehouse.users AS w
                SET end_date  = NOW(),
@@ -448,11 +462,11 @@ def run_incremental_load(batch_id: int):
                 OR  s.registered_at IS DISTINCT FROM w.registered_at
               );
         """), {"batch": batch_id})
-        print("   • closed out old versions of warehouse.users\n")
+    print("   • closed out old versions of warehouse.users\n")
 
-
-        # 1.2) SALES_MANAGERS ─────────────────────────────────────────────────────────────
-        # 1.2.a) Insert brand‐new sales_managers
+    # 1.2) SALES_MANAGERS
+    with warehouse_engine.begin() as conn:
+        # 1.2.a) Insert brand-new sales_managers
         conn.execute(text("""
             INSERT INTO warehouse.sales_managers (
                 manager_id, first_name, last_name, email, hired_at,
@@ -475,9 +489,10 @@ def run_incremental_load(batch_id: int):
                  AND w.end_date = '9999-12-31'::DATE
             WHERE w.manager_id IS NULL;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • inserted new warehouse.sales_managers")
+    print("   • inserted new warehouse.sales_managers")
 
-        # 1.2.b) For changed sales_managers, insert new “active” row
+    with warehouse_engine.begin() as conn:
+        # 1.2.b) Insert new versions for changed sales_managers
         conn.execute(text("""
             INSERT INTO warehouse.sales_managers (
                 manager_id, first_name, last_name, email, hired_at,
@@ -504,8 +519,9 @@ def run_incremental_load(batch_id: int):
               OR  s.email      IS DISTINCT FROM w.email
               OR  s.hired_at   IS DISTINCT FROM w.hired_at;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • inserted new versions for changed warehouse.sales_managers")
+    print("   • inserted new versions for changed warehouse.sales_managers")
 
+    with warehouse_engine.begin() as conn:
         # 1.2.c) Close out old active sales_managers
         conn.execute(text("""
             UPDATE warehouse.sales_managers AS w
@@ -521,11 +537,11 @@ def run_incremental_load(batch_id: int):
                 OR  s.hired_at   IS DISTINCT FROM w.hired_at
               );
         """), {"batch": batch_id})
-        print("   • closed out old versions of warehouse.sales_managers\n")
+    print("   • closed out old versions of warehouse.sales_managers\n")
 
-
-        # 1.3) COURSES ─────────────────────────────────────────────────────────────────────
-        # 1.3.a) Insert brand‐new courses
+    # 1.3) COURSES
+    with warehouse_engine.begin() as conn:
+        # 1.3.a) Insert brand-new courses
         conn.execute(text("""
             INSERT INTO warehouse.courses (
                 course_id, title, subject, description, price_in_rubbles, created_at,
@@ -549,9 +565,10 @@ def run_incremental_load(batch_id: int):
                  AND w.end_date = '9999-12-31'::DATE
             WHERE w.course_id IS NULL;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • inserted new warehouse.courses")
+    print("   • inserted new warehouse.courses")
 
-        # 1.3.b) For changed courses, insert new “active” row
+    with warehouse_engine.begin() as conn:
+        # 1.3.b) Insert new versions for changed courses
         conn.execute(text("""
             INSERT INTO warehouse.courses (
                 course_id, title, subject, description, price_in_rubbles, created_at,
@@ -580,8 +597,9 @@ def run_incremental_load(batch_id: int):
               OR  s.price_in_rubbles  IS DISTINCT FROM w.price_in_rubbles
               OR  s.created_at        IS DISTINCT FROM w.created_at;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • inserted new versions for changed warehouse.courses")
+    print("   • inserted new versions for changed warehouse.courses")
 
+    with warehouse_engine.begin() as conn:
         # 1.3.c) Close out old active courses
         conn.execute(text("""
             UPDATE warehouse.courses AS w
@@ -598,11 +616,11 @@ def run_incremental_load(batch_id: int):
                 OR  s.created_at        IS DISTINCT FROM w.created_at
               );
         """), {"batch": batch_id})
-        print("   • closed out old versions of warehouse.courses\n")
+    print("   • closed out old versions of warehouse.courses\n")
 
-
-        # 1.4) ENROLLMENTS ────────────────────────────────────────────────────────────────
-        # 1.4.a) Insert brand‐new enrollments (use user_sk & course_sk)
+    # 1.4) ENROLLMENTS
+    with warehouse_engine.begin() as conn:
+        # 1.4.a) Insert brand-new enrollments
         conn.execute(text("""
             INSERT INTO warehouse.enrollments (
                 enrollment_id, user_sk, course_sk, enrolled_at, status,
@@ -631,9 +649,10 @@ def run_incremental_load(batch_id: int):
                  AND w.end_date = '9999-12-31'::DATE
             WHERE w.enrollment_id IS NULL;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • inserted new warehouse.enrollments")
+    print("   • inserted new warehouse.enrollments")
 
-        # 1.4.b) For changed enrollments, insert new “active” row
+    with warehouse_engine.begin() as conn:
+        # 1.4.b) Insert new versions for changed enrollments
         conn.execute(text("""
             INSERT INTO warehouse.enrollments (
                 enrollment_id, user_sk, course_sk, enrolled_at, status,
@@ -674,8 +693,9 @@ def run_incremental_load(batch_id: int):
               OR  s.enrolled_at IS DISTINCT FROM w.enrolled_at
               OR  s.status      IS DISTINCT FROM w.status;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • inserted new versions for changed warehouse.enrollments")
+    print("   • inserted new versions for changed warehouse.enrollments")
 
+    with warehouse_engine.begin() as conn:
         # 1.4.c) Close out old active enrollments
         conn.execute(text("""
             UPDATE warehouse.enrollments AS w
@@ -705,11 +725,11 @@ def run_incremental_load(batch_id: int):
                 OR  s.status      IS DISTINCT FROM w.status
               );
         """), {"batch": batch_id})
-        print("   • closed out old versions of warehouse.enrollments\n")
+    print("   • closed out old versions of warehouse.enrollments\n")
 
-
-        # 1.5) SALES ───────────────────────────────────────────────────────────────────────
-        # 1.5.a) Insert brand‐new sales (use enrollment_sk & sales_manager_sk)
+    # 1.5) SALES
+    with warehouse_engine.begin() as conn:
+        # 1.5.a) Insert brand-new sales
         conn.execute(text("""
             INSERT INTO warehouse.sales (
                 sale_id, enrollment_sk, sales_manager_sk, sale_date, cost_in_rubbles,
@@ -738,9 +758,10 @@ def run_incremental_load(batch_id: int):
                  AND w.end_date = '9999-12-31'::DATE
             WHERE w.sale_id IS NULL;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • inserted new warehouse.sales")
+    print("   • inserted new warehouse.sales")
 
-        # 1.5.b) For changed sales, insert new “active” row
+    with warehouse_engine.begin() as conn:
+        # 1.5.b) Insert new versions for changed sales
         conn.execute(text("""
             INSERT INTO warehouse.sales (
                 sale_id, enrollment_sk, sales_manager_sk, sale_date, cost_in_rubbles,
@@ -781,8 +802,9 @@ def run_incremental_load(batch_id: int):
               OR  s.sale_date       IS DISTINCT FROM w.sale_date
               OR  s.cost_in_rubbles IS DISTINCT FROM w.cost_in_rubbles;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • inserted new versions for changed warehouse.sales")
+    print("   • inserted new versions for changed warehouse.sales")
 
+    with warehouse_engine.begin() as conn:
         # 1.5.c) Close out old active sales
         conn.execute(text("""
             UPDATE warehouse.sales AS w
@@ -812,11 +834,11 @@ def run_incremental_load(batch_id: int):
                 OR  s.cost_in_rubbles IS DISTINCT FROM w.cost_in_rubbles
               );
         """), {"batch": batch_id})
-        print("   • closed out old versions of warehouse.sales\n")
+    print("   • closed out old versions of warehouse.sales\n")
 
-
-        # 1.6) TRAFFIC_SOURCES ─────────────────────────────────────────────────────────────
-        # 1.6.a) Insert brand‐new traffic_sources
+    # 1.6) TRAFFIC_SOURCES
+    with warehouse_engine.begin() as conn:
+        # 1.6.a) Insert brand-new traffic_sources
         conn.execute(text("""
             INSERT INTO warehouse.traffic_sources (
                 source_id, name, channel, details,
@@ -838,9 +860,10 @@ def run_incremental_load(batch_id: int):
                  AND w.end_date = '9999-12-31'::DATE
             WHERE w.source_id IS NULL;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • inserted new warehouse.traffic_sources")
+    print("   • inserted new warehouse.traffic_sources")
 
-        # 1.6.b) For changed traffic_sources, insert new “active” row
+    with warehouse_engine.begin() as conn:
+        # 1.6.b) Insert new versions for changed traffic_sources
         conn.execute(text("""
             INSERT INTO warehouse.traffic_sources (
                 source_id, name, channel, details,
@@ -863,10 +886,11 @@ def run_incremental_load(batch_id: int):
             WHERE 
                   s.name    IS DISTINCT FROM w.name
               OR  s.channel IS DISTINCT FROM w.channel
-              OR  COALESCE(s.details, '') <> COALESCE(w.details, '');
+              OR  COALESCE(s.details, '') IS DISTINCT FROM COALESCE(w.details, '');
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • inserted new versions for changed warehouse.traffic_sources")
+    print("   • inserted new versions for changed warehouse.traffic_sources")
 
+    with warehouse_engine.begin() as conn:
         # 1.6.c) Close out old active traffic_sources
         conn.execute(text("""
             UPDATE warehouse.traffic_sources AS w
@@ -878,14 +902,14 @@ def run_incremental_load(batch_id: int):
               AND (
                     s.name    IS DISTINCT FROM w.name
                 OR  s.channel IS DISTINCT FROM w.channel
-                OR  COALESCE(s.details, '') <> COALESCE(w.details, '')
+                OR  COALESCE(s.details, '') IS DISTINCT FROM COALESCE(w.details, '')
               );
         """), {"batch": batch_id})
-        print("   • closed out old versions of warehouse.traffic_sources\n")
+    print("   • closed out old versions of warehouse.traffic_sources\n")
 
-
-        # 1.7) USER_TRAFFIC ───────────────────────────────────────────────────────────────
-        # 1.7.a) Insert brand‐new user_traffic
+    # 1.7) USER_TRAFFIC
+    with warehouse_engine.begin() as conn:
+        # 1.7.a) Insert brand-new user_traffic
         conn.execute(text("""
             INSERT INTO warehouse.user_traffic (
                 user_sk, traffic_source_sk, referred_at, campaign_code,
@@ -915,9 +939,10 @@ def run_incremental_load(batch_id: int):
              AND w.end_date = '9999-12-31'::DATE
             WHERE w.user_traffic_sk IS NULL;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • inserted new warehouse.user_traffic")
+    print("   • inserted new warehouse.user_traffic")
 
-        # 1.7.b) For changed user_traffic, insert new “active” row
+    with warehouse_engine.begin() as conn:
+        # 1.7.b) Insert new versions for changed user_traffic
         conn.execute(text("""
             INSERT INTO warehouse.user_traffic (
                 user_sk, traffic_source_sk, referred_at, campaign_code,
@@ -945,8 +970,9 @@ def run_incremental_load(batch_id: int):
              AND t.end_date = '9999-12-31'::DATE
             WHERE COALESCE(s.campaign_code, '') <> COALESCE(w.campaign_code, '');
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-        print("   • inserted new versions for changed warehouse.user_traffic")
+    print("   • inserted new versions for changed warehouse.user_traffic")
 
+    with warehouse_engine.begin() as conn:
         # 1.7.c) Close out old active user_traffic
         conn.execute(text("""
             UPDATE warehouse.user_traffic AS w
@@ -965,146 +991,209 @@ def run_incremental_load(batch_id: int):
               AND w.end_date   = '9999-12-31'::DATE
               AND COALESCE(s.campaign_code, '') <> COALESCE(w.campaign_code, '');
         """), {"batch": batch_id})
-        print("   • closed out old versions of warehouse.user_traffic\n")
+    print("   • closed out old versions of warehouse.user_traffic\n")
 
-    # ─── 2) Rebuild ALL “star_schema” dims ─────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────────────────────
+    # 2) Refresh “star_schema” dims & fact
+    # ───────────────────────────────────────────────────────────────────────────────
+
+    # 2.0) DELETE existing fact_sales (FK constraints require this first)
     with warehouse_engine.begin() as conn:
-        # 2.1) dim_user
-        conn.execute(text("""
-            DELETE FROM star_schema.dim_user;
-            INSERT INTO star_schema.dim_user
-              (user_id, first_name, last_name, email, signup_date)
-            SELECT
-              w.user_id,
-              w.first_name,
-              w.last_name,
-              w.email,
-              w.registered_at::DATE AS signup_date
-            FROM warehouse.users AS w
-            WHERE w.end_date = '9999-12-31'::DATE;
-        """))
-        print("   • loaded star_schema.dim_user")
+        conn.execute(text("DELETE FROM star_schema.fact_sales;"))
+    print("   • cleared star_schema.fact_sales")
 
-        # 2.2) dim_course
-        conn.execute(text("DELETE FROM star_schema.dim_course;"))
+    # 2.1) dim_user – delete + re‐insert changed keys (explicit SK)
+    with warehouse_engine.begin() as conn:
+        conn.execute(text("""
+            DELETE FROM star_schema.dim_user 
+            WHERE user_key IN (
+                SELECT u.user_sk 
+                FROM warehouse.users u
+                WHERE u.insert_id = :batch OR u.update_id = :batch
+            );
+        """), {"batch": batch_id})
+        conn.execute(text("""
+            INSERT INTO star_schema.dim_user
+              (user_key, user_id, first_name, last_name, email, signup_date)
+            SELECT
+              u.user_sk    AS user_key,
+              u.user_id,
+              u.first_name,
+              u.last_name,
+              u.email,
+              u.registered_at::DATE AS signup_date
+            FROM warehouse.users u
+            WHERE u.end_date = '9999-12-31'::DATE
+              AND (u.insert_id = :batch OR u.update_id = :batch);
+        """), {"batch": batch_id})
+    print("   • updated star_schema.dim_user")
+
+    # 2.2) dim_course – delete + re‐insert changed keys (explicit SK)
+    with warehouse_engine.begin() as conn:
+        conn.execute(text("""
+            DELETE FROM star_schema.dim_course
+            WHERE course_key IN (
+                SELECT c.course_sk 
+                FROM warehouse.courses c
+                WHERE c.insert_id = :batch OR c.update_id = :batch
+            );
+        """), {"batch": batch_id})
         conn.execute(text("""
             INSERT INTO star_schema.dim_course
-              (course_id, title, subject, price_in_rubbles)
+              (course_key, course_id, title, subject, price_in_rubbles)
             SELECT
+              c.course_sk    AS course_key,
               c.course_id,
               c.title,
               c.subject,
               c.price_in_rubbles
-            FROM warehouse.courses AS c
-            WHERE c.end_date = '9999-12-31'::DATE;
-        """))
-        rows_loaded = conn.execute(text("""
-            SELECT COUNT(*)
-            FROM warehouse.courses
-            WHERE end_date = '9999-12-31'::DATE;
-        """)).scalar_one()
-        print(f"   • loaded star_schema.dim_course ({rows_loaded} rows)")
+            FROM warehouse.courses c
+            WHERE c.end_date = '9999-12-31'::DATE
+              AND (c.insert_id = :batch OR c.update_id = :batch);
+        """), {"batch": batch_id})
+    print("   • updated star_schema.dim_course")
 
-        # 2.3) dim_traffic_source
+    # 2.3) dim_traffic_source – delete + re‐insert changed keys (explicit SK)
+    with warehouse_engine.begin() as conn:
         conn.execute(text("""
-            DELETE FROM star_schema.dim_traffic_source;
+            DELETE FROM star_schema.dim_traffic_source
+            WHERE traffic_source_key IN (
+                SELECT t.traffic_source_sk 
+                FROM warehouse.traffic_sources t
+                WHERE t.insert_id = :batch OR t.update_id = :batch
+            );
+        """), {"batch": batch_id})
+        conn.execute(text("""
             INSERT INTO star_schema.dim_traffic_source
-              (traffic_source_id, name, channel)
+              (traffic_source_key, traffic_source_id, name, channel)
             SELECT
-              t.source_id      AS traffic_source_id,
+              t.traffic_source_sk    AS traffic_source_key,
+              t.source_id            AS traffic_source_id,
               t.name,
               t.channel
-            FROM warehouse.traffic_sources AS t
-            WHERE t.end_date = '9999-12-31'::DATE;
-        """))
-        print("   • loaded star_schema.dim_traffic_source")
+            FROM warehouse.traffic_sources t
+            WHERE t.end_date = '9999-12-31'::DATE
+              AND (t.insert_id = :batch OR t.update_id = :batch);
+        """), {"batch": batch_id})
+    print("   • updated star_schema.dim_traffic_source")
 
-        # 2.4) dim_sales_manager
+    # 2.4) dim_sales_manager – delete + re‐insert changed keys (explicit SK)
+    with warehouse_engine.begin() as conn:
         conn.execute(text("""
-            DELETE FROM star_schema.dim_sales_manager;
+            DELETE FROM star_schema.dim_sales_manager
+            WHERE sales_manager_key IN (
+                SELECT m.sales_manager_sk 
+                FROM warehouse.sales_managers m
+                WHERE m.insert_id = :batch OR m.update_id = :batch
+            );
+        """), {"batch": batch_id})
+        conn.execute(text("""
             INSERT INTO star_schema.dim_sales_manager
-              (manager_id, first_name, last_name, email, hired_at)
+              (sales_manager_key, manager_id, first_name, last_name, email, hired_at)
             SELECT
+              m.sales_manager_sk    AS sales_manager_key,
               m.manager_id,
               m.first_name,
               m.last_name,
               m.email,
-              m.hired_at
-            FROM warehouse.sales_managers AS m
-            WHERE m.end_date = '9999-12-31'::DATE;
-        """))
-        print("   • loaded star_schema.dim_sales_manager")
+              m.hired_at::DATE
+            FROM warehouse.sales_managers m
+            WHERE m.end_date = '9999-12-31'::DATE
+              AND (m.insert_id = :batch OR m.update_id = :batch);
+        """), {"batch": batch_id})
+    print("   • updated star_schema.dim_sales_manager")
 
-        # 2.5) dim_date
-        conn.execute(text("DELETE FROM star_schema.dim_date;"))
-        result = conn.execute(text("""
-            SELECT MIN(sale_date)::DATE AS min_d, MAX(sale_date)::DATE AS max_d
-            FROM warehouse.sales;
-        """)).mappings().one()
-        min_date = result["min_d"]
-        max_date = result["max_d"]
-        if min_date is not None and max_date is not None:
-            conn.execute(text(f"""
-                INSERT INTO star_schema.dim_date
-                  (date, year, quarter, month, day, weekday)
-                SELECT
-                  gs::DATE AS date,
-                  EXTRACT(YEAR FROM gs)::INT   AS year,
-                  EXTRACT(QUARTER FROM gs)::INT AS quarter,
-                  EXTRACT(MONTH FROM gs)::INT   AS month,
-                  EXTRACT(DAY FROM gs)::INT     AS day,
-                  EXTRACT(DOW FROM gs)::INT     AS weekday
-                FROM generate_series(
-                  '{min_date}'::DATE,
-                  '{max_date}'::DATE,
-                  '1 day'::INTERVAL
-                ) AS gs;
-            """))
-            total_days = (max_date - min_date).days + 1
-            print(f"   • loaded star_schema.dim_date ({total_days} rows)")
-        else:
-            print("   • no sales dates found; skipped dim_date load")
-
-    # ─── 3) Re‐populate star_schema.fact_sales ────────────────────────────────────────
+    # 2.5) dim_date – only if new sales dates fall outside existing range
     with warehouse_engine.begin() as conn:
-        conn.execute(text("DELETE FROM star_schema.fact_sales;"))
-        print("   • cleared star_schema.fact_sales")
+        sale_row = conn.execute(text("""
+            SELECT 
+                MIN(s.sale_date)::DATE AS min_sale_date,
+                MAX(s.sale_date)::DATE AS max_sale_date
+            FROM warehouse.sales s
+            WHERE s.insert_id = :batch;
+        """), {"batch": batch_id}).mappings().one()
 
-        # 3.1) Use the correct join to dim_sales_manager + dim_traffic_source
+    min_sale_date = sale_row["min_sale_date"]
+    max_sale_date = sale_row["max_sale_date"]
+
+    if not min_sale_date or not max_sale_date:
+        print("   • no new sales dates found; skipped dim_date update")
+    else:
+        # Step A: fetch existing dim_date range
+        with warehouse_engine.begin() as conn:
+            drange = conn.execute(text("""
+                SELECT MIN(date) AS min_date, MAX(date) AS max_date
+                FROM star_schema.dim_date;
+            """)).mappings().one()
+
+        current_min = drange["min_date"]
+        current_max = drange["max_date"]
+
+        # Determine if rebuild is needed
+        needs_rebuild = False
+        if (current_min is None) or (min_sale_date < current_min) or (max_sale_date > current_max):
+            needs_rebuild = True
+
+        if needs_rebuild:
+            # Compute new min/max in Python
+            candidates_min = [d for d in [min_sale_date, current_min] if d is not None]
+            candidates_max = [d for d in [max_sale_date, current_max] if d is not None]
+            new_min = min(candidates_min) if candidates_min else datetime.date.today()
+            new_max = max(candidates_max) if candidates_max else datetime.date.today()
+
+            # Rebuild dim_date from new_min..new_max
+            with warehouse_engine.begin() as conn:
+                conn.execute(text("DELETE FROM star_schema.dim_date;"))
+                conn.execute(text(f"""
+                    INSERT INTO star_schema.dim_date
+                      (date_key, date, year, quarter, month, day, weekday)
+                    SELECT
+                      TO_CHAR(gs::DATE, 'YYYYMMDD')::INT AS date_key,
+                      gs::DATE                         AS date,
+                      EXTRACT(YEAR   FROM gs)::INT     AS year,
+                      EXTRACT(QUARTER FROM gs)::INT     AS quarter,
+                      EXTRACT(MONTH  FROM gs)::INT     AS month,
+                      EXTRACT(DAY    FROM gs)::INT     AS day,
+                      EXTRACT(DOW    FROM gs)::INT     AS weekday
+                    FROM generate_series(
+                      '{new_min}'::DATE,
+                      '{new_max}'::DATE,
+                      '1 day'::INTERVAL
+                    ) AS gs;
+                """))
+            day_count = (new_max - new_min).days + 1
+            print(f"   • extended star_schema.dim_date ({day_count} days from {new_min} to {new_max})")
+        else:
+            print("   • no date range extension needed for star_schema.dim_date")
+
+    # 2.6) fact_sales – load only new sales for this batch, joining on explicit SKs
+    with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO star_schema.fact_sales
-              (
-                sale_id,
-                user_key,
-                course_key,
-                sales_manager_key,
-                traffic_source_key,
-                date_key,
-                total_in_rubbles,
-                enrollment_count
-              )
+              (sale_id, user_key, course_key, sales_manager_key, traffic_source_key, date_key,
+               total_in_rubbles, enrollment_count)
             SELECT
               s.sale_id,
-              du.user_key,
-              dc.course_key,
-              dsm.sales_manager_key,
-              dts.traffic_source_key,
+              e.user_sk                   AS user_key,
+              e.course_sk                 AS course_key,
+              s.sales_manager_sk          AS sales_manager_key,
+              COALESCE(ut.traffic_source_sk, -1) AS traffic_source_key,
               dd.date_key,
-              s.cost_in_rubbles   AS total_in_rubbles,
-              1                   AS enrollment_count
-            FROM warehouse.sales AS s
-            JOIN warehouse.enrollments          AS e   ON s.enrollment_sk     = e.enrollment_sk
-            JOIN warehouse.user_traffic         AS ut  ON e.user_sk          = ut.user_sk
-                                                  AND ut.end_date       = '9999-12-31'::DATE
-            JOIN star_schema.dim_user           AS du  ON e.user_sk          = du.user_key
-            JOIN star_schema.dim_course         AS dc  ON e.course_sk        = dc.course_key
-            JOIN star_schema.dim_sales_manager  AS dsm ON s.sales_manager_sk = dsm.sales_manager_key
-            JOIN star_schema.dim_traffic_source AS dts ON ut.traffic_source_sk = dts.traffic_source_key
-            JOIN star_schema.dim_date           AS dd  ON s.sale_date::DATE  = dd.date;
-        """))
-        print("   • reloaded star_schema.fact_sales\n")
+              s.cost_in_rubbles           AS total_in_rubbles,
+              1                           AS enrollment_count
+            FROM warehouse.sales s
+            JOIN warehouse.enrollments e 
+              ON s.enrollment_sk = e.enrollment_sk
+            LEFT JOIN warehouse.user_traffic ut 
+              ON e.user_sk = ut.user_sk
+             AND ut.end_date = '9999-12-31'::DATE
+            JOIN star_schema.dim_date dd 
+              ON s.sale_date::DATE = dd.date
+            WHERE s.insert_id = :batch;
+        """), {"batch": batch_id})
+    print("   • loaded new records into star_schema.fact_sales\n")
 
-    print(f"[{datetime.datetime.now(datetime.timezone.utc)}] ✅ INCREMENTAL load complete.\n")
+    print(f"[{datetime.datetime.now(pytz.UTC)}] ✅ INCREMENTAL load complete.\n")
 
 
 if __name__ == "__main__":
@@ -1115,4 +1204,8 @@ if __name__ == "__main__":
     if sys.argv[1] == "full":
         run_full_load()
     else:
+        if len(sys.argv) < 3:
+            print("Error: Please provide batch_id for incremental load")
+            print(__doc__)
+            sys.exit(1)
         run_incremental_load(int(sys.argv[2]))
