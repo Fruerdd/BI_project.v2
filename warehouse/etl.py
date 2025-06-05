@@ -12,8 +12,10 @@ Usage:
 
 This script performs a Slowly Changing Dimension (SCD2) load into a “warehouse” schema,
 then builds a star‐schema (dim_user, dim_course, dim_traffic_source, dim_sales_manager, dim_date, fact_sales).
-Key change: each dim table’s surrogate key (user_key, course_key, etc.) is explicitly set to the warehouse SCD2 surrogate (user_sk, course_sk, etc.),
-so that fact_sales can join on those same surrogates and actually produce rows.
+
+**Key change for incremental:**
+During INCREMENTAL loads, we now rebuild the entire `fact_sales` from all **active** (`update_id IS NULL`, `end_date = '9999-12-31'`) rows in `warehouse.sales`.
+This ensures that _every_ current version (where `update_id IS NULL`) ends up in the star schema, not just those inserted in the current batch.
 """
 
 import sys
@@ -347,7 +349,7 @@ def run_full_load():
     total_days = (max_date - min_date).days + 1
     print(f"   • loaded star_schema.dim_date ({total_days} days from {min_date} to {max_date})")
 
-    # 3.6) fact_sales: join on warehouse SK → dim SK so rows actually appear
+    # 3.6) fact_sales: join on warehouse SKs → dim SKs so rows actually appear
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO star_schema.fact_sales
@@ -362,13 +364,13 @@ def run_full_load():
               dd.date_key,
               s.cost_in_rubbles           AS total_in_rubbles,
               1                           AS enrollment_count
-            FROM warehouse.sales s
-            JOIN warehouse.enrollments e 
+            FROM warehouse.sales AS s
+            JOIN warehouse.enrollments AS e 
               ON s.enrollment_sk = e.enrollment_sk
             LEFT JOIN warehouse.user_traffic ut 
               ON e.user_sk = ut.user_sk
              AND ut.end_date = '9999-12-31'::DATE
-            JOIN star_schema.dim_date dd 
+            JOIN star_schema.dim_date AS dd 
               ON s.sale_date::DATE = dd.date
             WHERE s.end_date = '9999-12-31'::DATE;
         """))
@@ -1110,7 +1112,8 @@ def run_incremental_load(batch_id: int):
                 MIN(s.sale_date)::DATE AS min_sale_date,
                 MAX(s.sale_date)::DATE AS max_sale_date
             FROM warehouse.sales s
-            WHERE s.insert_id = :batch;
+            WHERE s.insert_id = :batch
+              AND s.end_date = '9999-12-31'::DATE;
         """), {"batch": batch_id}).mappings().one()
 
     min_sale_date = sale_row["min_sale_date"]
@@ -1166,7 +1169,8 @@ def run_incremental_load(batch_id: int):
         else:
             print("   • no date range extension needed for star_schema.dim_date")
 
-    # 2.6) fact_sales – load only new sales for this batch, joining on explicit SKs
+    # 2.6) fact_sales – Rebuild entire fact from all “active” warehouse.sales rows
+    #            (only those with update_id IS NULL and end_date = '9999-12-31')
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO star_schema.fact_sales
@@ -1181,17 +1185,19 @@ def run_incremental_load(batch_id: int):
               dd.date_key,
               s.cost_in_rubbles           AS total_in_rubbles,
               1                           AS enrollment_count
-            FROM warehouse.sales s
-            JOIN warehouse.enrollments e 
+            FROM warehouse.sales AS s
+            JOIN warehouse.enrollments AS e 
               ON s.enrollment_sk = e.enrollment_sk
+             AND e.end_date = '9999-12-31'::DATE
             LEFT JOIN warehouse.user_traffic ut 
               ON e.user_sk = ut.user_sk
              AND ut.end_date = '9999-12-31'::DATE
-            JOIN star_schema.dim_date dd 
+            JOIN star_schema.dim_date AS dd 
               ON s.sale_date::DATE = dd.date
-            WHERE s.insert_id = :batch;
-        """), {"batch": batch_id})
-    print("   • loaded new records into star_schema.fact_sales\n")
+            WHERE s.update_id IS NULL
+              AND s.end_date = '9999-12-31'::DATE;
+        """))
+    print("   • rebuilt star_schema.fact_sales from all active warehouse.sales\n")
 
     print(f"[{datetime.datetime.now(pytz.UTC)}] ✅ INCREMENTAL load complete.\n")
 
