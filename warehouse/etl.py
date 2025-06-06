@@ -16,16 +16,31 @@ then builds a star‐schema (dim_user, dim_course, dim_traffic_source, dim_sales
 **Key change for incremental:**
 During INCREMENTAL loads, we now rebuild the entire `fact_sales` from all **active** (`update_id IS NULL`, `end_date = '9999-12-31'`) rows in `warehouse.sales`.
 This ensures that _every_ current version (where `update_id IS NULL`) ends up in the star schema, not just those inserted in the current batch.
+
+**NEW**: We also want to load **`data_sources/user_traffic.csv`** into `warehouse.user_traffic`
+(with `source_id_audit = 2`), using exactly the same SCD2 logic that we already use for `source.user_traffic` (“source” side is `source_id_audit = 1`).
+That means:
+  1. On a **full load**, insert all CSV rows (as if they were “brand‐new”) with `source_id_audit = 2`.
+  2. On an **incremental load**, do two sub‐steps:
+     - Insert any CSV row that did not exist at all in `warehouse.user_traffic` (matching on keys `(user_sk, traffic_source_sk, referred_at)`).
+     - For those that _did_ exist but whose `campaign_code` changed, “close out” the old version (set its `end_date = NOW()` and `update_id = batch`) and insert a new version with `source_id_audit = 2`.
+
+**Important**: _Don’t_ change **any** of the existing SCD2 logic against `source.user_traffic`; we merely tack on a second pass that picks up CSV‐side rows and treats them in parallel (just using `source_id_audit = 2`).
 """
 
 import sys
 import datetime
 import pytz
+import csv
 from sqlalchemy import create_engine, text
 
 # ───────────── Configuration ───────────────────────────────────────────────────
-DB_URL   = "postgresql+psycopg2://postgres:admin@localhost:5432/bi_project"
-SRC_MAIN = 1   # arbitrary source_id for audit
+DB_URL           = "postgresql+psycopg2://postgres:admin@localhost:5432/bi_project"
+SRC_MAIN         = 1   # arbitrary source_id for audit (the “source” schema)
+SRC_CSV_AUDIT_ID = 2   # arbitrary source_id for CSV‐based audit
+
+# Adjust this path if your CSV lives somewhere else:
+CSV_PATH = "data_sources/user_traffic.csv"
 
 # ───────────── Engines ───────────────────────────────────────────────────────────
 source_engine    = create_engine(DB_URL, echo=False)
@@ -58,8 +73,8 @@ def run_full_load():
     # ───────────────────────────────────────────────────────────────────────────────
     # 2) Populate each warehouse table in its own transaction (to release locks quickly)
     # ───────────────────────────────────────────────────────────────────────────────
-
-    # 2.1) USERS → warehouse.users (SCD2 full)
+    #
+    #  2.1) USERS → warehouse.users (SCD2 full)
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO warehouse.users
@@ -71,7 +86,7 @@ def run_full_load():
               u.last_name,
               u.email,
               u.phone,
-              u.country,                       -- added
+              u.country,
               u.registered_at,
               NOW()               AS start_date,
               '9999-12-31'::DATE  AS end_date,
@@ -82,7 +97,7 @@ def run_full_load():
         """), {"src_main": SRC_MAIN, "batch": batch_id})
     print("   • loaded warehouse.users")
 
-    # 2.2) SALES_MANAGERS → warehouse.sales_managers (SCD2 full)
+    #  2.2) SALES_MANAGERS → warehouse.sales_managers (SCD2 full)
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO warehouse.sales_managers
@@ -103,12 +118,12 @@ def run_full_load():
         """), {"src_main": SRC_MAIN, "batch": batch_id})
     print("   • loaded warehouse.sales_managers")
 
-    # 2.3) COURSES → warehouse.courses (SCD2 full)
+    #  2.3) COURSES → warehouse.courses (SCD2 full)
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO warehouse.courses
               (course_id, title, subject, description, price_in_rubbles, created_at,
-               category, sub_category,            -- added
+               category, sub_category,
                start_date, end_date, source_id, insert_id, update_id)
             SELECT
               c.course_id,
@@ -117,8 +132,8 @@ def run_full_load():
               c.description,
               c.price_in_rubbles,
               c.created_at,
-              cat.name                 AS category,    -- added
-              sub.name                 AS sub_category,-- added
+              cat.name                 AS category,
+              sub.name                 AS sub_category,
               NOW()                    AS start_date,
               '9999-12-31'::DATE       AS end_date,
               :src_main                AS source_id,
@@ -130,7 +145,7 @@ def run_full_load():
         """), {"src_main": SRC_MAIN, "batch": batch_id})
     print("   • loaded warehouse.courses")
 
-    # 2.4) ENROLLMENTS → warehouse.enrollments (SCD2 full)
+    #  2.4) ENROLLMENTS → warehouse.enrollments (SCD2 full)
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO warehouse.enrollments
@@ -157,7 +172,7 @@ def run_full_load():
         """), {"src_main": SRC_MAIN, "batch": batch_id})
     print("   • loaded warehouse.enrollments")
 
-    # 2.5) SALES → warehouse.sales (SCD2 full)
+    #  2.5) SALES → warehouse.sales (SCD2 full)
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO warehouse.sales
@@ -184,7 +199,7 @@ def run_full_load():
         """), {"src_main": SRC_MAIN, "batch": batch_id})
     print("   • loaded warehouse.sales")
 
-    # 2.6) TRAFFIC_SOURCES → warehouse.traffic_sources (SCD2 full)
+    #  2.6) TRAFFIC_SOURCES → warehouse.traffic_sources (SCD2 full)
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO warehouse.traffic_sources
@@ -204,7 +219,12 @@ def run_full_load():
         """), {"src_main": SRC_MAIN, "batch": batch_id})
     print("   • loaded warehouse.traffic_sources")
 
-    # 2.7) USER_TRAFFIC → warehouse.user_traffic (SCD2 full)
+    # ───────────────────────────────────────────────────────────────────────────────
+    #  2.7) USER_TRAFFIC → warehouse.user_traffic (SCD2 full from “source” side)
+    #        (this is exactly as before, except we now tack on a second sub‐step for CSV)
+    # ───────────────────────────────────────────────────────────────────────────────
+
+    #  2.7.a) All “source.user_traffic” rows → warehouse.user_traffic (SCD2 full, source_id_audit = 1)
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO warehouse.user_traffic
@@ -228,17 +248,75 @@ def run_full_load():
               ON ut.source_id = t.source_id
              AND t.end_date = '9999-12-31'::DATE;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-    print("   • loaded warehouse.user_traffic\n")
+    print("   • loaded warehouse.user_traffic from source.user_traffic (source_id_audit=1)")
 
     # ───────────────────────────────────────────────────────────────────────────────
-    # 3) Build “star_schema” dims & fact, each in its own transaction
+    #  2.7.b) Now load every row from CSV → warehouse.user_traffic (as if new, source_id_audit = 2)
+    #        * Full‐load version simply “truncates” domain above, so we can insert _all_ CSV rows fresh
+    # ───────────────────────────────────────────────────────────────────────────────
+    #
+    # We must look up u.user_sk  and t.traffic_source_sk by joining against warehouse.users/traffic_sources;
+    # then we insert with start_date=NOW(), end_date='9999-12-31', source_id_audit = 2.
+    #
+    # NB: We assume the CSV columns are exactly: user_id, source_id, referred_at (ISO‐timestamp), campaign_code
+    #
+    with warehouse_engine.begin() as conn:
+        reader = csv.DictReader(open(CSV_PATH, newline=""))
+        rows_to_insert = []
+        for row in reader:
+            # Each row in the CSV has user_id, source_id, referred_at, campaign_code
+            # We’ll pass these as params to the SELECT … INSERT; the SELECT will lookup user_sk & traffic_source_sk.
+            rows_to_insert.append({
+                "user_id"      : row["user_id"],
+                "source_id"    : row["source_id"],
+                "referred_at"  : row["referred_at"],
+                "campaign_code": row["campaign_code"],
+            })
+
+        # If there are no rows in the CSV, skip the block:
+        if rows_to_insert:
+            conn.execute(text("""
+                INSERT INTO warehouse.user_traffic
+                  (user_sk, traffic_source_sk, referred_at, campaign_code,
+                   start_date, end_date, source_id_audit, insert_id, update_id)
+                SELECT
+                  u.user_sk,
+                  t.traffic_source_sk,
+                  CAST(:referred_at AS TIMESTAMP),
+                  :campaign_code,
+                  NOW()               AS start_date,
+                  '9999-12-31'::DATE  AS end_date,
+                  :csv_audit          AS source_id_audit,
+                  :batch              AS insert_id,
+                  NULL                AS update_id
+                FROM warehouse.users AS u
+                JOIN warehouse.traffic_sources AS t
+                  ON t.source_id = :source_id
+                 AND t.end_date = '9999-12-31'::DATE
+                WHERE u.user_id = :user_id
+                  AND u.end_date = '9999-12-31'::DATE;
+            """), [
+                {
+                    "user_id"      : r["user_id"],
+                    "source_id"    : r["source_id"],
+                    "referred_at"  : r["referred_at"],
+                    "campaign_code": r["campaign_code"],
+                    "csv_audit"    : SRC_CSV_AUDIT_ID,
+                    "batch"        : batch_id
+                }
+                for r in rows_to_insert
+            ])
+    print("   • loaded warehouse.user_traffic from CSV (source_id_audit=2)\n")
+
+    # ───────────────────────────────────────────────────────────────────────────────
+    #  3) Build “star_schema” dims & fact, each in its own transaction (UNCHANGED)
     # ───────────────────────────────────────────────────────────────────────────────
 
-    # 3.1) dim_user: explicitly assign warehouse.user_sk → dim_user.user_key
+    #  3.1) dim_user
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO star_schema.dim_user
-              (user_key, user_id, first_name, last_name, email, signup_date, country)  -- added country
+              (user_key, user_id, first_name, last_name, email, signup_date, country)
             SELECT
               u.user_sk    AS user_key,
               u.user_id,
@@ -246,31 +324,31 @@ def run_full_load():
               u.last_name,
               u.email,
               u.registered_at::DATE AS signup_date,
-              u.country                   -- added
+              u.country
             FROM warehouse.users AS u
             WHERE u.end_date = '9999-12-31'::DATE;
         """))
     print("   • loaded star_schema.dim_user")
 
-    # 3.2) dim_course: assign warehouse.course_sk → dim_course.course_key
+    #  3.2) dim_course
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO star_schema.dim_course
-              (course_key, course_id, title, subject, price_in_rubbles, category, sub_category)  -- added category, sub_category
+              (course_key, course_id, title, subject, price_in_rubbles, category, sub_category)
             SELECT
               c.course_sk    AS course_key,
               c.course_id,
               c.title,
               c.subject,
               c.price_in_rubbles,
-              c.category,       -- added
-              c.sub_category    -- added
+              c.category,
+              c.sub_category
             FROM warehouse.courses AS c
             WHERE c.end_date = '9999-12-31'::DATE;
         """))
     print("   • loaded star_schema.dim_course")
 
-    # 3.3) dim_traffic_source: assign warehouse.traffic_source_sk → dim_traffic_source.traffic_source_key
+    #  3.3) dim_traffic_source
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO star_schema.dim_traffic_source
@@ -285,7 +363,7 @@ def run_full_load():
         """))
     print("   • loaded star_schema.dim_traffic_source")
 
-    # 3.4) dim_sales_manager: assign warehouse.sales_manager_sk → dim_sales_manager.sales_manager_key
+    #  3.4) dim_sales_manager
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO star_schema.dim_sales_manager
@@ -302,7 +380,7 @@ def run_full_load():
         """))
     print("   • loaded star_schema.dim_sales_manager")
 
-    # 3.5) dim_date – compute per‐table min/max separately (no Cartesian join)
+    #  3.5) dim_date
     with warehouse_engine.begin() as conn:
         result = conn.execute(text("""
             SELECT
@@ -345,7 +423,7 @@ def run_full_load():
               TO_CHAR(gs::DATE, 'YYYYMMDD')::INT AS date_key,
               gs::DATE                            AS date,
               EXTRACT(YEAR   FROM gs)::INT        AS year,
-              EXTRACT(QUARTER FROM gs)::INT        AS quarter,
+              EXTRACT(QUARTER FROM gs)::INT       AS quarter,
               EXTRACT(MONTH  FROM gs)::INT        AS month,
               EXTRACT(DAY    FROM gs)::INT        AS day,
               EXTRACT(DOW    FROM gs)::INT        AS weekday
@@ -358,34 +436,45 @@ def run_full_load():
     total_days = (max_date - min_date).days + 1
     print(f"   • loaded star_schema.dim_date ({total_days} days from {min_date} to {max_date})")
 
-    # 3.6) fact_sales: join on warehouse SKs → dim SKs so rows actually appear
+    #  3.6) fact_sales
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
-            INSERT INTO star_schema.fact_sales
-              (sale_id, user_key, course_key, sales_manager_key, traffic_source_key, date_key,
-               total_in_rubbles, enrollment_count)
-            SELECT
-              s.sale_id,
-              e.user_sk                   AS user_key,
-              e.course_sk                 AS course_key,
-              s.sales_manager_sk          AS sales_manager_key,
-              COALESCE(ut.traffic_source_sk, -1) AS traffic_source_key,
-              dd.date_key,
-              s.cost_in_rubbles           AS total_in_rubbles,
-              1                           AS enrollment_count
-            FROM warehouse.sales AS s
-            JOIN warehouse.enrollments AS e 
-              ON s.enrollment_sk = e.enrollment_sk
-            LEFT JOIN warehouse.user_traffic ut 
-              ON e.user_sk = ut.user_sk
-             AND ut.end_date = '9999-12-31'::DATE
-            JOIN star_schema.dim_date AS dd 
-              ON s.sale_date::DATE = dd.date
-            WHERE s.end_date = '9999-12-31'::DATE;
+                INSERT INTO star_schema.fact_sales
+      (sale_id, user_key, course_key, sales_manager_key, traffic_source_key, date_key,
+       total_in_rubbles, enrollment_count)
+    SELECT
+      s.sale_id,
+      e.user_sk                   AS user_key,
+      e.course_sk                 AS course_key,
+      s.sales_manager_sk          AS sales_manager_key,
+      COALESCE(ut.traffic_source_sk, -1) AS traffic_source_key,
+      dd.date_key,
+      s.cost_in_rubbles           AS total_in_rubbles,
+      1                           AS enrollment_count
+    FROM warehouse.sales AS s
+    JOIN warehouse.enrollments AS e 
+      ON s.enrollment_sk = e.enrollment_sk
+    LEFT JOIN (
+      SELECT DISTINCT ON (user_sk)
+         user_sk,
+         traffic_source_sk,
+         referred_at,
+         campaign_code
+      FROM warehouse.user_traffic
+      WHERE end_date = '9999-12-31'::DATE
+      ORDER BY user_sk, referred_at DESC
+      -- ^ “Distinct on (user_sk)” picks the single ACTIVE row with the latest referred_at per user
+    ) AS ut
+      ON e.user_sk = ut.user_sk
+    JOIN star_schema.dim_date AS dd 
+      ON s.sale_date::DATE = dd.date
+    WHERE s.end_date = '9999-12-31'::DATE;
+
         """))
     print("   • loaded star_schema.fact_sales\n")
 
     print(f"[{datetime.datetime.now(pytz.UTC)}] ✅ FULL load complete.\n")
+
 
 
 def run_incremental_load(batch_id: int):
@@ -393,12 +482,12 @@ def run_incremental_load(batch_id: int):
     print(f"[{now_ts}] ▶️  Starting INCREMENTAL load (batch_id={batch_id})\n")
 
     # ───────────────────────────────────────────────────────────────────────────────
-    # 1) Incrementally update "warehouse" schema with SCD2 logic, one-step-per-txn
+    #  1) Incrementally update “warehouse” schema with SCD2 logic, one-step-per-txn
     # ───────────────────────────────────────────────────────────────────────────────
 
-    # 1.1) USERS
+    #  1.1) USERS (unchanged)
     with warehouse_engine.begin() as conn:
-        # 1.1.a) Insert brand-new users
+        #  1.1.a) Insert brand-new users
         conn.execute(text("""
             INSERT INTO warehouse.users (
                 user_id, first_name, last_name, email, phone, country, registered_at,
@@ -410,7 +499,7 @@ def run_incremental_load(batch_id: int):
                 s.last_name,
                 s.email,
                 s.phone,
-                s.country,                 -- added
+                s.country,
                 s.registered_at,
                 NOW()               AS start_date,
                 '9999-12-31'::DATE  AS end_date,
@@ -426,7 +515,7 @@ def run_incremental_load(batch_id: int):
     print("   • inserted new warehouse.users")
 
     with warehouse_engine.begin() as conn:
-        # 1.1.b) Insert new versions for changed users
+        #  1.1.b) Insert new versions for changed users
         conn.execute(text("""
             INSERT INTO warehouse.users (
                 user_id, first_name, last_name, email, phone, country, registered_at,
@@ -438,7 +527,7 @@ def run_incremental_load(batch_id: int):
                 s.last_name,
                 s.email,
                 s.phone,
-                s.country,                 -- added
+                s.country,
                 s.registered_at,
                 NOW()               AS start_date,
                 '9999-12-31'::DATE  AS end_date,
@@ -454,13 +543,13 @@ def run_incremental_load(batch_id: int):
               OR  s.last_name     IS DISTINCT FROM w.last_name
               OR  s.email         IS DISTINCT FROM w.email
               OR  s.phone         IS DISTINCT FROM w.phone
-              OR  s.country       IS DISTINCT FROM w.country       -- added
+              OR  s.country       IS DISTINCT FROM w.country
               OR  s.registered_at IS DISTINCT FROM w.registered_at;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
     print("   • inserted new versions for changed warehouse.users")
 
     with warehouse_engine.begin() as conn:
-        # 1.1.c) Close out old active user records
+        #  1.1.c) Close out old active user records
         conn.execute(text("""
             UPDATE warehouse.users AS w
                SET end_date  = NOW(),
@@ -473,15 +562,15 @@ def run_incremental_load(batch_id: int):
                 OR  s.last_name     IS DISTINCT FROM w.last_name
                 OR  s.email         IS DISTINCT FROM w.email
                 OR  s.phone         IS DISTINCT FROM w.phone
-                OR  s.country       IS DISTINCT FROM w.country       -- added
+                OR  s.country       IS DISTINCT FROM w.country
                 OR  s.registered_at IS DISTINCT FROM w.registered_at
               );
         """), {"batch": batch_id})
     print("   • closed out old versions of warehouse.users\n")
 
-    # 1.2) SALES_MANAGERS
+    #  1.2) SALES_MANAGERS (unchanged)
     with warehouse_engine.begin() as conn:
-        # 1.2.a) Insert brand-new sales_managers
+        #  1.2.a) Insert brand-new sales_managers
         conn.execute(text("""
             INSERT INTO warehouse.sales_managers (
                 manager_id, first_name, last_name, email, hired_at,
@@ -507,7 +596,7 @@ def run_incremental_load(batch_id: int):
     print("   • inserted new warehouse.sales_managers")
 
     with warehouse_engine.begin() as conn:
-        # 1.2.b) Insert new versions for changed sales_managers
+        #  1.2.b) Insert new versions for changed sales_managers
         conn.execute(text("""
             INSERT INTO warehouse.sales_managers (
                 manager_id, first_name, last_name, email, hired_at,
@@ -537,11 +626,11 @@ def run_incremental_load(batch_id: int):
     print("   • inserted new versions for changed warehouse.sales_managers")
 
     with warehouse_engine.begin() as conn:
-        # 1.2.c) Close out old active sales_managers
+        #  1.2.c) Close out old active sales_managers
         conn.execute(text("""
             UPDATE warehouse.sales_managers AS w
-               SET end_date  = NOW(),
-                   update_id = :batch
+               SET end_date     = NOW(),
+                   update_id    = :batch
             FROM source.sales_managers AS s
             WHERE w.manager_id = s.manager_id
               AND w.end_date = '9999-12-31'::DATE
@@ -554,13 +643,13 @@ def run_incremental_load(batch_id: int):
         """), {"batch": batch_id})
     print("   • closed out old versions of warehouse.sales_managers\n")
 
-    # 1.3) COURSES
+    #  1.3) COURSES (unchanged)
     with warehouse_engine.begin() as conn:
-        # 1.3.a) Insert brand-new courses
+        #  1.3.a) Insert brand-new courses
         conn.execute(text("""
             INSERT INTO warehouse.courses (
                 course_id, title, subject, description, price_in_rubbles, created_at,
-                category, sub_category,            -- added
+                category, sub_category,
                 start_date, end_date, source_id, insert_id, update_id
             )
             SELECT
@@ -570,8 +659,8 @@ def run_incremental_load(batch_id: int):
                 s.description,
                 s.price_in_rubbles,
                 s.created_at,
-                cat.name                 AS category,    -- added
-                sub.name                 AS sub_category,-- added
+                cat.name                 AS category,
+                sub.name                 AS sub_category,
                 NOW()                    AS start_date,
                 '9999-12-31'::DATE       AS end_date,
                 :src_main                AS source_id,
@@ -588,11 +677,11 @@ def run_incremental_load(batch_id: int):
     print("   • inserted new warehouse.courses")
 
     with warehouse_engine.begin() as conn:
-        # 1.3.b) Insert new versions for changed courses
+        #  1.3.b) Insert new versions for changed courses
         conn.execute(text("""
             INSERT INTO warehouse.courses (
                 course_id, title, subject, description, price_in_rubbles, created_at,
-                category, sub_category,            -- added
+                category, sub_category,
                 start_date, end_date, source_id, insert_id, update_id
             )
             SELECT
@@ -602,8 +691,8 @@ def run_incremental_load(batch_id: int):
                 s.description,
                 s.price_in_rubbles,
                 s.created_at,
-                cat.name                 AS category,    -- added
-                sub.name                 AS sub_category,-- added
+                cat.name                 AS category,
+                sub.name                 AS sub_category,
                 NOW()                    AS start_date,
                 '9999-12-31'::DATE       AS end_date,
                 :src_main                AS source_id,
@@ -621,13 +710,13 @@ def run_incremental_load(batch_id: int):
               OR  COALESCE(s.description, '') <> COALESCE(w.description, '')
               OR  s.price_in_rubbles  IS DISTINCT FROM w.price_in_rubbles
               OR  s.created_at        IS DISTINCT FROM w.created_at
-              OR  cat.name            IS DISTINCT FROM w.category       -- added
-              OR  sub.name            IS DISTINCT FROM w.sub_category;  -- added
+              OR  cat.name            IS DISTINCT FROM w.category
+              OR  sub.name            IS DISTINCT FROM w.sub_category;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
     print("   • inserted new versions for changed warehouse.courses")
 
     with warehouse_engine.begin() as conn:
-        # 1.3.c) Close out old active courses
+        #  1.3.c) Close out old active courses
         conn.execute(text("""
             UPDATE warehouse.courses AS w
                SET end_date  = NOW(),
@@ -643,15 +732,15 @@ def run_incremental_load(batch_id: int):
                 OR  COALESCE(s.description, '') <> COALESCE(w.description, '')
                 OR  s.price_in_rubbles  IS DISTINCT FROM w.price_in_rubbles
                 OR  s.created_at        IS DISTINCT FROM w.created_at
-                OR  cat.name            IS DISTINCT FROM w.category       -- added
-                OR  sub.name            IS DISTINCT FROM w.sub_category   -- added
+                OR  cat.name            IS DISTINCT FROM w.category
+                OR  sub.name            IS DISTINCT FROM w.sub_category
               );
         """), {"batch": batch_id})
     print("   • closed out old versions of warehouse.courses\n")
 
-    # 1.4) ENROLLMENTS
+    #  1.4) ENROLLMENTS (unchanged)
     with warehouse_engine.begin() as conn:
-        # 1.4.a) Insert brand-new enrollments
+        #  1.4.a) Insert brand-new enrollments
         conn.execute(text("""
             INSERT INTO warehouse.enrollments (
                 enrollment_id, user_sk, course_sk, enrolled_at, status,
@@ -683,7 +772,7 @@ def run_incremental_load(batch_id: int):
     print("   • inserted new warehouse.enrollments")
 
     with warehouse_engine.begin() as conn:
-        # 1.4.b) Insert new versions for changed enrollments
+        #  1.4.b) Insert new versions for changed enrollments
         conn.execute(text("""
             INSERT INTO warehouse.enrollments (
                 enrollment_id, user_sk, course_sk, enrolled_at, status,
@@ -727,7 +816,7 @@ def run_incremental_load(batch_id: int):
     print("   • inserted new versions for changed warehouse.enrollments")
 
     with warehouse_engine.begin() as conn:
-        # 1.4.c) Close out old active enrollments
+        #  1.4.c) Close out old active enrollments
         conn.execute(text("""
             UPDATE warehouse.enrollments AS w
                SET end_date  = NOW(),
@@ -758,9 +847,9 @@ def run_incremental_load(batch_id: int):
         """), {"batch": batch_id})
     print("   • closed out old versions of warehouse.enrollments\n")
 
-    # 1.5) SALES
+    #  1.5) SALES (unchanged)
     with warehouse_engine.begin() as conn:
-        # 1.5.a) Insert brand-new sales
+        #  1.5.a) Insert brand-new sales
         conn.execute(text("""
             INSERT INTO warehouse.sales (
                 sale_id, enrollment_sk, sales_manager_sk, sale_date, cost_in_rubbles,
@@ -792,7 +881,7 @@ def run_incremental_load(batch_id: int):
     print("   • inserted new warehouse.sales")
 
     with warehouse_engine.begin() as conn:
-        # 1.5.b) Insert new versions for changed sales
+        #  1.5.b) Insert new versions for changed sales
         conn.execute(text("""
             INSERT INTO warehouse.sales (
                 sale_id, enrollment_sk, sales_manager_sk, sale_date, cost_in_rubbles,
@@ -836,7 +925,7 @@ def run_incremental_load(batch_id: int):
     print("   • inserted new versions for changed warehouse.sales")
 
     with warehouse_engine.begin() as conn:
-        # 1.5.c) Close out old active sales
+        #  1.5.c) Close out old active sales
         conn.execute(text("""
             UPDATE warehouse.sales AS w
                SET end_date  = NOW(),
@@ -867,9 +956,9 @@ def run_incremental_load(batch_id: int):
         """), {"batch": batch_id})
     print("   • closed out old versions of warehouse.sales\n")
 
-    # 1.6) TRAFFIC_SOURCES
+    #  1.6) TRAFFIC_SOURCES (unchanged)
     with warehouse_engine.begin() as conn:
-        # 1.6.a) Insert brand-new traffic_sources
+        #  1.6.a) Insert brand-new traffic_sources
         conn.execute(text("""
             INSERT INTO warehouse.traffic_sources (
                 source_id, name, channel, details,
@@ -894,7 +983,7 @@ def run_incremental_load(batch_id: int):
     print("   • inserted new warehouse.traffic_sources")
 
     with warehouse_engine.begin() as conn:
-        # 1.6.b) Insert new versions for changed traffic_sources
+        #  1.6.b) Insert new versions for changed traffic_sources
         conn.execute(text("""
             INSERT INTO warehouse.traffic_sources (
                 source_id, name, channel, details,
@@ -922,7 +1011,7 @@ def run_incremental_load(batch_id: int):
     print("   • inserted new versions for changed warehouse.traffic_sources")
 
     with warehouse_engine.begin() as conn:
-        # 1.6.c) Close out old active traffic_sources
+        #  1.6.c) Close out old active traffic_sources
         conn.execute(text("""
             UPDATE warehouse.traffic_sources AS w
                SET end_date     = NOW(),
@@ -938,9 +1027,13 @@ def run_incremental_load(batch_id: int):
         """), {"batch": batch_id})
     print("   • closed out old versions of warehouse.traffic_sources\n")
 
-    # 1.7) USER_TRAFFIC
+    # ───────────────────────────────────────────────────────────────────────────────
+    #  1.7) USER_TRAFFIC
+    # ───────────────────────────────────────────────────────────────────────────────
+
+    #  1.7.a) Insert brand-new “source.user_traffic” rows → warehouse.user_traffic
+    #          (SCD2, source_id_audit = 1)
     with warehouse_engine.begin() as conn:
-        # 1.7.a) Insert brand-new user_traffic
         conn.execute(text("""
             INSERT INTO warehouse.user_traffic (
                 user_sk, traffic_source_sk, referred_at, campaign_code,
@@ -970,10 +1063,10 @@ def run_incremental_load(batch_id: int):
              AND w.end_date = '9999-12-31'::DATE
             WHERE w.user_traffic_sk IS NULL;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-    print("   • inserted new warehouse.user_traffic")
+    print("   • inserted new warehouse.user_traffic from source.user_traffic (source_id_audit=1)")
 
     with warehouse_engine.begin() as conn:
-        # 1.7.b) Insert new versions for changed user_traffic
+        #  1.7.b) Insert new versions for changed “source.user_traffic” (campaign_code changed)
         conn.execute(text("""
             INSERT INTO warehouse.user_traffic (
                 user_sk, traffic_source_sk, referred_at, campaign_code,
@@ -1001,10 +1094,10 @@ def run_incremental_load(batch_id: int):
              AND t.end_date = '9999-12-31'::DATE
             WHERE COALESCE(s.campaign_code, '') <> COALESCE(w.campaign_code, '');
         """), {"src_main": SRC_MAIN, "batch": batch_id})
-    print("   • inserted new versions for changed warehouse.user_traffic")
+    print("   • inserted new versions for changed warehouse.user_traffic from source (source_id_audit=1)")
 
     with warehouse_engine.begin() as conn:
-        # 1.7.c) Close out old active user_traffic
+        #  1.7.c) Close out old active “source.user_traffic” rows (campaign_code changed)
         conn.execute(text("""
             UPDATE warehouse.user_traffic AS w
                SET end_date     = NOW(),
@@ -1022,18 +1115,183 @@ def run_incremental_load(batch_id: int):
               AND w.end_date   = '9999-12-31'::DATE
               AND COALESCE(s.campaign_code, '') <> COALESCE(w.campaign_code, '');
         """), {"batch": batch_id})
-    print("   • closed out old versions of warehouse.user_traffic\n")
+    print("   • closed out old versions of warehouse.user_traffic from source (source_id_audit=1)\n")
 
     # ───────────────────────────────────────────────────────────────────────────────
-    # 2) Refresh “star_schema” dims & fact
+    #  1.7.1) CSV “user_traffic.csv” → warehouse.user_traffic (source_id_audit = 2)
+    #          (Incremental logic: brand‐new CSV rows + changed campaign_code)
+    # ───────────────────────────────────────────────────────────────────────────────
+    #
+    # We must:
+    #   (a) Insert brand‐new CSV rows that do not exist in warehouse.user_traffic
+    #       (matching on user_sk, traffic_source_sk, referred_at).
+    #   (b) For existing CSV rows whose campaign_code changed, “close” the old version,
+    #       then insert a brand‐new version with source_id_audit = 2.
+    #
+    # We read the CSV fully and do two passes: new rows & changed rows.
+    #
+    csv_rows = list(csv.DictReader(open(CSV_PATH, newline="")))
+
+    # (1.a) INSERT brand‐new CSV rows that don't exist yet:
+    #       We look up for each CSV row: "warehouse.user_traffic" match on (user_sk, traffic_source_sk, referred_at, end_date='9999-12-31').
+    #       If not found, we insert it as a new SCD2 row (start_date=NOW(), end_date='9999-12-31', source_id_audit=2).
+    new_inserts = []
+    for r in csv_rows:
+        # Check existence in active warehouse.user_traffic
+        with warehouse_engine.begin() as conn:
+            found = conn.execute(text("""
+                SELECT 1
+                  FROM warehouse.user_traffic AS w
+                  JOIN warehouse.users         AS u ON u.user_sk = w.user_sk
+                  JOIN warehouse.traffic_sources AS t ON t.traffic_source_sk = w.traffic_source_sk
+                 WHERE u.user_id = :user_id
+                   AND t.source_id = :source_id
+                   AND w.referred_at = CAST(:referred_at AS TIMESTAMP)
+                   AND w.end_date = '9999-12-31'::DATE
+               LIMIT 1;
+            """), {
+                "user_id"     : r["user_id"],
+                "source_id"   : r["source_id"],
+                "referred_at" : r["referred_at"],
+            }).first()
+
+        if not found:
+            # This CSV row doesn’t exist in the active slice → we’ll insert it fresh.
+            new_inserts.append(r)
+
+    if new_inserts:
+        with warehouse_engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO warehouse.user_traffic
+                  (user_sk, traffic_source_sk, referred_at, campaign_code,
+                   start_date, end_date, source_id_audit, insert_id, update_id)
+                SELECT
+                  u.user_sk,
+                  t.traffic_source_sk,
+                  CAST(:referred_at AS TIMESTAMP),
+                  :campaign_code,
+                  NOW()               AS start_date,
+                  '9999-12-31'::DATE  AS end_date,
+                  :csv_audit          AS source_id_audit,
+                  :batch              AS insert_id,
+                  NULL                AS update_id
+                FROM warehouse.users AS u
+                JOIN warehouse.traffic_sources AS t
+                  ON t.source_id = :source_id
+                 AND t.end_date = '9999-12-31'::DATE
+                WHERE u.user_id = :user_id
+                  AND u.end_date = '9999-12-31'::DATE;
+            """), [
+                {
+                    "user_id"      : r["user_id"],
+                    "source_id"    : r["source_id"],
+                    "referred_at"  : r["referred_at"],
+                    "campaign_code": r["campaign_code"],
+                    "csv_audit"    : SRC_CSV_AUDIT_ID,
+                    "batch"        : batch_id
+                }
+                for r in new_inserts
+            ])
+    print(f"   • inserted {len(new_inserts)} new CSV rows into warehouse.user_traffic (source_id_audit=2)")
+
+    # (1.b) Find any CSV rows whose campaign_code changed _relative to_ the currently‐active row:
+    #       If we see a row (user_id, source_id, referred_at) that _is_ in warehouse.user_traffic but its active version
+    #       has a different campaign_code, we “close out” the old version and insert a new one.
+    changed_inserts = []
+    for r in csv_rows:
+        # Look up the active warehouse.user_traffic for this combination:
+        row = None
+        with warehouse_engine.begin() as conn:
+            row = conn.execute(text("""
+                SELECT w.user_traffic_sk,
+                       w.campaign_code
+                  FROM warehouse.user_traffic AS w
+                  JOIN warehouse.users AS u ON u.user_sk = w.user_sk
+                  JOIN warehouse.traffic_sources AS t ON t.traffic_source_sk = w.traffic_source_sk
+                 WHERE u.user_id = :user_id
+                   AND t.source_id = :source_id
+                   AND w.referred_at = CAST(:referred_at AS TIMESTAMP)
+                   AND w.end_date = '9999-12-31'::DATE
+                 LIMIT 1;
+            """), {
+                "user_id"     : r["user_id"],
+                "source_id"   : r["source_id"],
+                "referred_at" : r["referred_at"],
+            }).first()
+
+        if row:
+            existing_campaign = row["campaign_code"] or ""
+            new_campaign      = r["campaign_code"] or ""
+            if new_campaign != existing_campaign:
+                # The campaign_code changed → close out the old version and insert a new one
+                changed_inserts.append(r)
+
+                # (i) Close out the old version:
+                with warehouse_engine.begin() as conn:
+                    conn.execute(text("""
+                        UPDATE warehouse.user_traffic AS w
+                           SET end_date   = NOW(),
+                               update_id  = :batch
+                        FROM warehouse.users AS u
+                        JOIN warehouse.traffic_sources AS t ON t.traffic_source_sk = w.traffic_source_sk
+                        WHERE u.user_id = :user_id
+                          AND t.source_id = :source_id
+                          AND w.referred_at = CAST(:referred_at AS TIMESTAMP)
+                          AND w.end_date = '9999-12-31'::DATE;
+                    """), {
+                        "user_id"     : r["user_id"],
+                        "source_id"   : r["source_id"],
+                        "referred_at" : r["referred_at"],
+                        "batch"       : batch_id
+                    })
+
+    # (ii) Insert a fresh version for each “changed” CSV row:
+    if changed_inserts:
+        with warehouse_engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO warehouse.user_traffic
+                  (user_sk, traffic_source_sk, referred_at, campaign_code,
+                   start_date, end_date, source_id_audit, insert_id, update_id)
+                SELECT
+                  u.user_sk,
+                  t.traffic_source_sk,
+                  CAST(:referred_at AS TIMESTAMP),
+                  :campaign_code,
+                  NOW()               AS start_date,
+                  '9999-12-31'::DATE  AS end_date,
+                  :csv_audit          AS source_id_audit,
+                  :batch              AS insert_id,
+                  NULL                AS update_id
+                FROM warehouse.users AS u
+                JOIN warehouse.traffic_sources AS t
+                  ON t.source_id = :source_id
+                 AND t.end_date = '9999-12-31'::DATE
+                WHERE u.user_id = :user_id
+                  AND u.end_date = '9999-12-31'::DATE;
+            """), [
+                {
+                    "user_id"      : r["user_id"],
+                    "source_id"    : r["source_id"],
+                    "referred_at"  : r["referred_at"],
+                    "campaign_code": r["campaign_code"],
+                    "csv_audit"    : SRC_CSV_AUDIT_ID,
+                    "batch"        : batch_id
+                }
+                for r in changed_inserts
+            ])
+    print(f"   • closed out and re‐inserted {len(changed_inserts)} changed CSV rows into warehouse.user_traffic (source_id_audit=2)\n")
+
+
+    # ───────────────────────────────────────────────────────────────────────────────
+    #  2) Refresh “star_schema” dims & fact
     # ───────────────────────────────────────────────────────────────────────────────
 
-    # 2.0) DELETE existing fact_sales (FK constraints require this first)
+    #  2.0) DELETE existing fact_sales (FK constraints require this first)
     with warehouse_engine.begin() as conn:
         conn.execute(text("DELETE FROM star_schema.fact_sales;"))
     print("   • cleared star_schema.fact_sales")
 
-    # 2.1) dim_user – delete + re‐insert changed keys (explicit SK)
+    #  2.1) dim_user – delete + re‐insert changed keys (explicit SK)
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             DELETE FROM star_schema.dim_user 
@@ -1045,7 +1303,7 @@ def run_incremental_load(batch_id: int):
         """), {"batch": batch_id})
         conn.execute(text("""
             INSERT INTO star_schema.dim_user
-              (user_key, user_id, first_name, last_name, email, signup_date, country)  -- added country
+              (user_key, user_id, first_name, last_name, email, signup_date, country)
             SELECT
               u.user_sk    AS user_key,
               u.user_id,
@@ -1053,14 +1311,14 @@ def run_incremental_load(batch_id: int):
               u.last_name,
               u.email,
               u.registered_at::DATE AS signup_date,
-              u.country                   -- added
+              u.country
             FROM warehouse.users u
             WHERE u.end_date = '9999-12-31'::DATE
               AND (u.insert_id = :batch OR u.update_id = :batch);
         """), {"batch": batch_id})
     print("   • updated star_schema.dim_user")
 
-    # 2.2) dim_course – delete + re‐insert changed keys (explicit SK)
+    #  2.2) dim_course – delete + re‐insert changed keys (explicit SK)
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             DELETE FROM star_schema.dim_course
@@ -1072,22 +1330,22 @@ def run_incremental_load(batch_id: int):
         """), {"batch": batch_id})
         conn.execute(text("""
             INSERT INTO star_schema.dim_course
-              (course_key, course_id, title, subject, price_in_rubbles, category, sub_category)  -- added category, sub_category
+              (course_key, course_id, title, subject, price_in_rubbles, category, sub_category)
             SELECT
               c.course_sk    AS course_key,
               c.course_id,
               c.title,
               c.subject,
               c.price_in_rubbles,
-              c.category,       -- added
-              c.sub_category    -- added
+              c.category,
+              c.sub_category
             FROM warehouse.courses c
             WHERE c.end_date = '9999-12-31'::DATE
               AND (c.insert_id = :batch OR c.update_id = :batch);
         """), {"batch": batch_id})
     print("   • updated star_schema.dim_course")
 
-    # 2.3) dim_traffic_source – delete + re‐insert changed keys (explicit SK)
+    #  2.3) dim_traffic_source – delete + re‐insert changed keys (explicit SK)
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             DELETE FROM star_schema.dim_traffic_source
@@ -1111,7 +1369,7 @@ def run_incremental_load(batch_id: int):
         """), {"batch": batch_id})
     print("   • updated star_schema.dim_traffic_source")
 
-    # 2.4) dim_sales_manager – delete + re‐insert changed keys (explicit SK)
+    #  2.4) dim_sales_manager – delete + re‐insert changed keys (explicit SK)
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             DELETE FROM star_schema.dim_sales_manager
@@ -1137,7 +1395,7 @@ def run_incremental_load(batch_id: int):
         """), {"batch": batch_id})
     print("   • updated star_schema.dim_sales_manager")
 
-    # 2.5) dim_date – only if new sales dates fall outside existing range
+    #  2.5) dim_date – only if new sales dates fall outside existing range (UNCHANGED)
     with warehouse_engine.begin() as conn:
         sale_row = conn.execute(text("""
             SELECT 
@@ -1154,7 +1412,6 @@ def run_incremental_load(batch_id: int):
     if not min_sale_date or not max_sale_date:
         print("   • no new sales dates found; skipped dim_date update")
     else:
-        # Step A: fetch existing dim_date range
         with warehouse_engine.begin() as conn:
             drange = conn.execute(text("""
                 SELECT MIN(date) AS min_date, MAX(date) AS max_date
@@ -1164,19 +1421,16 @@ def run_incremental_load(batch_id: int):
         current_min = drange["min_date"]
         current_max = drange["max_date"]
 
-        # Determine if rebuild is needed
         needs_rebuild = False
         if (current_min is None) or (min_sale_date < current_min) or (max_sale_date > current_max):
             needs_rebuild = True
 
         if needs_rebuild:
-            # Compute new min/max in Python
             candidates_min = [d for d in [min_sale_date, current_min] if d is not None]
             candidates_max = [d for d in [max_sale_date, current_max] if d is not None]
             new_min = min(candidates_min) if candidates_min else datetime.date.today()
             new_max = max(candidates_max) if candidates_max else datetime.date.today()
 
-            # Rebuild dim_date from new_min..new_max
             with warehouse_engine.begin() as conn:
                 conn.execute(text("DELETE FROM star_schema.dim_date;"))
                 conn.execute(text(f"""
@@ -1201,8 +1455,7 @@ def run_incremental_load(batch_id: int):
         else:
             print("   • no date range extension needed for star_schema.dim_date")
 
-    # 2.6) fact_sales – Rebuild entire fact from all “active” warehouse.sales rows
-    #            (only those with update_id IS NULL and end_date = '9999-12-31')
+    #  2.6) fact_sales – Rebuild entire fact from all “active” warehouse.sales rows
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO star_schema.fact_sales
@@ -1232,6 +1485,7 @@ def run_incremental_load(batch_id: int):
     print("   • rebuilt star_schema.fact_sales from all active warehouse.sales\n")
 
     print(f"[{datetime.datetime.now(pytz.UTC)}] ✅ INCREMENTAL load complete.\n")
+
 
 
 if __name__ == "__main__":
