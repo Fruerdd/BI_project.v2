@@ -1,9 +1,7 @@
-# ────────────────────────────────────────────────────────────────────────────────
+#!/usr/bin/env python3
 # create_star_schema.py
 # (Add a new dimension for sales managers and update fact_sales accordingly.)
 # ────────────────────────────────────────────────────────────────────────────────
-
-#!/usr/bin/env python3
 
 from sqlalchemy import (
     create_engine, MetaData, Table, Column,
@@ -21,6 +19,8 @@ with engine.begin() as conn:
 # 3) Bind MetaData to the 'star_schema' schema
 metadata = MetaData(schema="star_schema")
 
+# ────────────────────────────────────────────────────────────────────────────────
+
 # 4) Dimension: Users
 dim_user = Table(
     "dim_user", metadata,
@@ -30,6 +30,9 @@ dim_user = Table(
     Column("last_name",   String(100)),
     Column("email",       String(255)),
     Column("signup_date", Date),
+
+    # ── ADDED: country column in dim_user ───────────────────────────────────────
+    Column("country",     String(100))                                              # ← ADDED
 )
 
 # 5) Dimension: Courses
@@ -40,6 +43,8 @@ dim_course = Table(
     Column("title",            String(255)),
     Column("subject",          String(100)),
     Column("price_in_rubbles", Integer),
+
+    # These two were already present:
     Column("category",         String(100)),
     Column("sub_category",     String(100)),
 )

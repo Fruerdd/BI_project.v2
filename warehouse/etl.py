@@ -63,7 +63,7 @@ def run_full_load():
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO warehouse.users
-              (user_id, first_name, last_name, email, phone, registered_at,
+              (user_id, first_name, last_name, email, phone, country, registered_at,
                start_date, end_date, source_id, insert_id, update_id)
             SELECT
               u.user_id,
@@ -71,6 +71,7 @@ def run_full_load():
               u.last_name,
               u.email,
               u.phone,
+              u.country,                       -- added
               u.registered_at,
               NOW()               AS start_date,
               '9999-12-31'::DATE  AS end_date,
@@ -107,6 +108,7 @@ def run_full_load():
         conn.execute(text("""
             INSERT INTO warehouse.courses
               (course_id, title, subject, description, price_in_rubbles, created_at,
+               category, sub_category,            -- added
                start_date, end_date, source_id, insert_id, update_id)
             SELECT
               c.course_id,
@@ -115,12 +117,16 @@ def run_full_load():
               c.description,
               c.price_in_rubbles,
               c.created_at,
-              NOW()               AS start_date,
-              '9999-12-31'::DATE  AS end_date,
-              :src_main           AS source_id,
-              :batch              AS insert_id,
-              NULL                AS update_id
-            FROM source.courses AS c;
+              cat.name                 AS category,    -- added
+              sub.name                 AS sub_category,-- added
+              NOW()                    AS start_date,
+              '9999-12-31'::DATE       AS end_date,
+              :src_main                AS source_id,
+              :batch                   AS insert_id,
+              NULL                     AS update_id
+            FROM source.courses AS c
+            JOIN source.categories    AS cat ON c.category_id    = cat.category_id
+            JOIN source.subcategories AS sub ON c.subcategory_id = sub.subcategory_id;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
     print("   • loaded warehouse.courses")
 
@@ -232,14 +238,15 @@ def run_full_load():
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO star_schema.dim_user
-              (user_key, user_id, first_name, last_name, email, signup_date)
+              (user_key, user_id, first_name, last_name, email, signup_date, country)  -- added country
             SELECT
               u.user_sk    AS user_key,
               u.user_id,
               u.first_name,
               u.last_name,
               u.email,
-              u.registered_at::DATE AS signup_date
+              u.registered_at::DATE AS signup_date,
+              u.country                   -- added
             FROM warehouse.users AS u
             WHERE u.end_date = '9999-12-31'::DATE;
         """))
@@ -249,13 +256,15 @@ def run_full_load():
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO star_schema.dim_course
-              (course_key, course_id, title, subject, price_in_rubbles)
+              (course_key, course_id, title, subject, price_in_rubbles, category, sub_category)  -- added category, sub_category
             SELECT
               c.course_sk    AS course_key,
               c.course_id,
               c.title,
               c.subject,
-              c.price_in_rubbles
+              c.price_in_rubbles,
+              c.category,       -- added
+              c.sub_category    -- added
             FROM warehouse.courses AS c
             WHERE c.end_date = '9999-12-31'::DATE;
         """))
@@ -392,7 +401,7 @@ def run_incremental_load(batch_id: int):
         # 1.1.a) Insert brand-new users
         conn.execute(text("""
             INSERT INTO warehouse.users (
-                user_id, first_name, last_name, email, phone, registered_at,
+                user_id, first_name, last_name, email, phone, country, registered_at,
                 start_date, end_date, source_id, insert_id, update_id
             )
             SELECT
@@ -401,6 +410,7 @@ def run_incremental_load(batch_id: int):
                 s.last_name,
                 s.email,
                 s.phone,
+                s.country,                 -- added
                 s.registered_at,
                 NOW()               AS start_date,
                 '9999-12-31'::DATE  AS end_date,
@@ -419,7 +429,7 @@ def run_incremental_load(batch_id: int):
         # 1.1.b) Insert new versions for changed users
         conn.execute(text("""
             INSERT INTO warehouse.users (
-                user_id, first_name, last_name, email, phone, registered_at,
+                user_id, first_name, last_name, email, phone, country, registered_at,
                 start_date, end_date, source_id, insert_id, update_id
             )
             SELECT
@@ -428,6 +438,7 @@ def run_incremental_load(batch_id: int):
                 s.last_name,
                 s.email,
                 s.phone,
+                s.country,                 -- added
                 s.registered_at,
                 NOW()               AS start_date,
                 '9999-12-31'::DATE  AS end_date,
@@ -443,6 +454,7 @@ def run_incremental_load(batch_id: int):
               OR  s.last_name     IS DISTINCT FROM w.last_name
               OR  s.email         IS DISTINCT FROM w.email
               OR  s.phone         IS DISTINCT FROM w.phone
+              OR  s.country       IS DISTINCT FROM w.country       -- added
               OR  s.registered_at IS DISTINCT FROM w.registered_at;
         """), {"src_main": SRC_MAIN, "batch": batch_id})
     print("   • inserted new versions for changed warehouse.users")
@@ -461,6 +473,7 @@ def run_incremental_load(batch_id: int):
                 OR  s.last_name     IS DISTINCT FROM w.last_name
                 OR  s.email         IS DISTINCT FROM w.email
                 OR  s.phone         IS DISTINCT FROM w.phone
+                OR  s.country       IS DISTINCT FROM w.country       -- added
                 OR  s.registered_at IS DISTINCT FROM w.registered_at
               );
         """), {"batch": batch_id})
@@ -547,6 +560,7 @@ def run_incremental_load(batch_id: int):
         conn.execute(text("""
             INSERT INTO warehouse.courses (
                 course_id, title, subject, description, price_in_rubbles, created_at,
+                category, sub_category,            -- added
                 start_date, end_date, source_id, insert_id, update_id
             )
             SELECT
@@ -556,12 +570,16 @@ def run_incremental_load(batch_id: int):
                 s.description,
                 s.price_in_rubbles,
                 s.created_at,
-                NOW()               AS start_date,
-                '9999-12-31'::DATE  AS end_date,
-                :src_main           AS source_id,
-                :batch              AS insert_id,
-                NULL                AS update_id
+                cat.name                 AS category,    -- added
+                sub.name                 AS sub_category,-- added
+                NOW()                    AS start_date,
+                '9999-12-31'::DATE       AS end_date,
+                :src_main                AS source_id,
+                :batch                   AS insert_id,
+                NULL                     AS update_id
             FROM source.courses AS s
+            JOIN source.categories    AS cat ON s.category_id    = cat.category_id
+            JOIN source.subcategories AS sub ON s.subcategory_id = sub.subcategory_id
             LEFT JOIN warehouse.courses AS w
               ON s.course_id = w.course_id
                  AND w.end_date = '9999-12-31'::DATE
@@ -574,6 +592,7 @@ def run_incremental_load(batch_id: int):
         conn.execute(text("""
             INSERT INTO warehouse.courses (
                 course_id, title, subject, description, price_in_rubbles, created_at,
+                category, sub_category,            -- added
                 start_date, end_date, source_id, insert_id, update_id
             )
             SELECT
@@ -583,21 +602,27 @@ def run_incremental_load(batch_id: int):
                 s.description,
                 s.price_in_rubbles,
                 s.created_at,
-                NOW()               AS start_date,
-                '9999-12-31'::DATE  AS end_date,
-                :src_main           AS source_id,
-                :batch              AS insert_id,
-                NULL                AS update_id
+                cat.name                 AS category,    -- added
+                sub.name                 AS sub_category,-- added
+                NOW()                    AS start_date,
+                '9999-12-31'::DATE       AS end_date,
+                :src_main                AS source_id,
+                :batch                   AS insert_id,
+                NULL                     AS update_id
             FROM source.courses AS s
             JOIN warehouse.courses AS w
               ON s.course_id = w.course_id
              AND w.end_date = '9999-12-31'::DATE
+            JOIN source.categories    AS cat ON s.category_id    = cat.category_id
+            JOIN source.subcategories AS sub ON s.subcategory_id = sub.subcategory_id
             WHERE 
                   s.title             IS DISTINCT FROM w.title
               OR  s.subject           IS DISTINCT FROM w.subject
               OR  COALESCE(s.description, '') <> COALESCE(w.description, '')
               OR  s.price_in_rubbles  IS DISTINCT FROM w.price_in_rubbles
-              OR  s.created_at        IS DISTINCT FROM w.created_at;
+              OR  s.created_at        IS DISTINCT FROM w.created_at
+              OR  cat.name            IS DISTINCT FROM w.category       -- added
+              OR  sub.name            IS DISTINCT FROM w.sub_category;  -- added
         """), {"src_main": SRC_MAIN, "batch": batch_id})
     print("   • inserted new versions for changed warehouse.courses")
 
@@ -608,6 +633,8 @@ def run_incremental_load(batch_id: int):
                SET end_date  = NOW(),
                    update_id = :batch
             FROM source.courses AS s
+            JOIN source.categories    AS cat ON s.category_id    = cat.category_id
+            JOIN source.subcategories AS sub ON s.subcategory_id = sub.subcategory_id
             WHERE w.course_id = s.course_id
               AND w.end_date = '9999-12-31'::DATE
               AND (
@@ -616,6 +643,8 @@ def run_incremental_load(batch_id: int):
                 OR  COALESCE(s.description, '') <> COALESCE(w.description, '')
                 OR  s.price_in_rubbles  IS DISTINCT FROM w.price_in_rubbles
                 OR  s.created_at        IS DISTINCT FROM w.created_at
+                OR  cat.name            IS DISTINCT FROM w.category       -- added
+                OR  sub.name            IS DISTINCT FROM w.sub_category   -- added
               );
         """), {"batch": batch_id})
     print("   • closed out old versions of warehouse.courses\n")
@@ -1016,14 +1045,15 @@ def run_incremental_load(batch_id: int):
         """), {"batch": batch_id})
         conn.execute(text("""
             INSERT INTO star_schema.dim_user
-              (user_key, user_id, first_name, last_name, email, signup_date)
+              (user_key, user_id, first_name, last_name, email, signup_date, country)  -- added country
             SELECT
               u.user_sk    AS user_key,
               u.user_id,
               u.first_name,
               u.last_name,
               u.email,
-              u.registered_at::DATE AS signup_date
+              u.registered_at::DATE AS signup_date,
+              u.country                   -- added
             FROM warehouse.users u
             WHERE u.end_date = '9999-12-31'::DATE
               AND (u.insert_id = :batch OR u.update_id = :batch);
@@ -1042,13 +1072,15 @@ def run_incremental_load(batch_id: int):
         """), {"batch": batch_id})
         conn.execute(text("""
             INSERT INTO star_schema.dim_course
-              (course_key, course_id, title, subject, price_in_rubbles)
+              (course_key, course_id, title, subject, price_in_rubbles, category, sub_category)  -- added category, sub_category
             SELECT
               c.course_sk    AS course_key,
               c.course_id,
               c.title,
               c.subject,
-              c.price_in_rubbles
+              c.price_in_rubbles,
+              c.category,       -- added
+              c.sub_category    -- added
             FROM warehouse.courses c
             WHERE c.end_date = '9999-12-31'::DATE
               AND (c.insert_id = :batch OR c.update_id = :batch);
