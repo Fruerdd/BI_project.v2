@@ -1232,17 +1232,19 @@ def run_incremental_load(batch_id: int):
                         UPDATE warehouse.user_traffic AS w
                            SET end_date   = NOW(),
                                update_id  = :batch
-                        FROM warehouse.users AS u
-                        JOIN warehouse.traffic_sources AS t ON t.traffic_source_sk = w.traffic_source_sk
+                        FROM warehouse.users AS u,
+                             warehouse.traffic_sources AS t
                         WHERE u.user_id = :user_id
                           AND t.source_id = :source_id
+                          AND w.user_sk = u.user_sk
+                          AND w.traffic_source_sk = t.traffic_source_sk
                           AND w.referred_at = CAST(:referred_at AS TIMESTAMP)
                           AND w.end_date = '9999-12-31'::DATE;
                     """), {
-                        "user_id"     : r["user_id"],
-                        "source_id"   : r["source_id"],
-                        "referred_at" : r["referred_at"],
-                        "batch"       : batch_id
+                        "user_id": r["user_id"],
+                        "source_id": r["source_id"],
+                        "referred_at": r["referred_at"],
+                        "batch": batch_id
                     })
 
     # (ii) Insert a fresh version for each “changed” CSV row:
@@ -1480,7 +1482,6 @@ def run_incremental_load(batch_id: int):
               ON s.enrollment_sk = e.enrollment_sk
              AND e.end_date = '9999-12-31'::DATE
             LEFT JOIN (
-              -- pick exactly one “latest” user_traffic row per user_sk
               SELECT DISTINCT ON (user_sk)
                  user_sk,
                  traffic_source_sk,
@@ -1494,9 +1495,10 @@ def run_incremental_load(batch_id: int):
             JOIN star_schema.dim_date AS dd 
               ON s.sale_date::DATE = dd.date
             WHERE s.update_id IS NULL
-              AND s.end_date = '9999-12-31'::DATE;
+              AND s.end_date = '9999-12-31'::DATE
+            ON CONFLICT (sale_id) DO NOTHING;
         """))
-    print("   • rebuilt star_schema.fact_sales from all active warehouse.sales\n")
+    print("   • rebuilt star_schema.fact_sales (duplicates skipped)\n")
 
     print(f"[{datetime.datetime.now(pytz.UTC)}] ✅ INCREMENTAL load complete.\n")
 
