@@ -1217,7 +1217,7 @@ def run_incremental_load(batch_id: int):
                 "user_id"     : r["user_id"],
                 "source_id"   : r["source_id"],
                 "referred_at" : r["referred_at"],
-            }).first()
+            }).mappings().first()
 
         if row:
             existing_campaign = row["campaign_code"] or ""
@@ -1456,6 +1456,11 @@ def run_incremental_load(batch_id: int):
             print("   • no date range extension needed for star_schema.dim_date")
 
     #  2.6) fact_sales – Rebuild entire fact from all “active” warehouse.sales rows
+    # ─────────────────────────────────────────────────────────────────────────────────────────
+    #  2.6) fact_sales – Rebuild entire fact from all “active” warehouse.sales rows
+    #      (use the same DISTINCT ON subquery for user_traffic as in full load)
+    # ─────────────────────────────────────────────────────────────────────────────────────────
+
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO star_schema.fact_sales
@@ -1474,9 +1479,18 @@ def run_incremental_load(batch_id: int):
             JOIN warehouse.enrollments AS e 
               ON s.enrollment_sk = e.enrollment_sk
              AND e.end_date = '9999-12-31'::DATE
-            LEFT JOIN warehouse.user_traffic ut 
+            LEFT JOIN (
+              -- pick exactly one “latest” user_traffic row per user_sk
+              SELECT DISTINCT ON (user_sk)
+                 user_sk,
+                 traffic_source_sk,
+                 referred_at,
+                 campaign_code
+              FROM warehouse.user_traffic
+              WHERE end_date = '9999-12-31'::DATE
+              ORDER BY user_sk, referred_at DESC
+            ) AS ut
               ON e.user_sk = ut.user_sk
-             AND ut.end_date = '9999-12-31'::DATE
             JOIN star_schema.dim_date AS dd 
               ON s.sale_date::DATE = dd.date
             WHERE s.update_id IS NULL
