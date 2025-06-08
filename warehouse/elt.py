@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 
 """
-etl.py
+elt.py
 
 Usage:
   # Full initial load (batch_id=1)
-  python etl.py full
+  python elt.py full
 
   # Incremental load (pass the next batch_id, e.g. 2, 3, …)
-  python etl.py inc 2
+  python elt.py inc 2
 
 This script performs a Slowly Changing Dimension (SCD2) load into a “warehouse” schema,
 then builds a star‐schema (dim_user, dim_course, dim_traffic_source, dim_sales_manager, dim_date, fact_sales).
@@ -567,7 +567,18 @@ def run_incremental_load(batch_id: int):
               );
         """), {"batch": batch_id})
     print("   • closed out old versions of warehouse.users\n")
-
+    with warehouse_engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE warehouse.users AS w
+               SET end_date  = NOW(),
+                   update_id = :batch
+            WHERE w.end_date = '9999-12-31'::DATE
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM source.users AS s
+                   WHERE s.user_id = w.user_id
+              );
+        """), {"batch": batch_id})
     #  1.2) SALES_MANAGERS (unchanged)
     with warehouse_engine.begin() as conn:
         #  1.2.a) Insert brand-new sales_managers
@@ -1320,6 +1331,26 @@ def run_incremental_load(batch_id: int):
         """), {"batch": batch_id})
     print("   • updated star_schema.dim_user")
 
+    with warehouse_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO star_schema.dim_user
+              (user_key, user_id, first_name, last_name, email, signup_date, country)
+            SELECT
+              u.user_sk,
+              u.user_id,
+              u.first_name,
+              u.last_name,
+              u.email,
+              u.registered_at::DATE,
+              u.country
+            FROM warehouse.users AS u
+            LEFT JOIN star_schema.dim_user AS d
+              ON d.user_key = u.user_sk
+            WHERE u.end_date = '9999-12-31'::DATE
+              AND d.user_key IS NULL;
+        """))
+    print("   • inserted any missing star_schema.dim_user entries")
+
     #  2.2) dim_course – delete + re‐insert changed keys (explicit SK)
     with warehouse_engine.begin() as conn:
         conn.execute(text("""
@@ -1370,6 +1401,23 @@ def run_incremental_load(batch_id: int):
               AND (t.insert_id = :batch OR t.update_id = :batch);
         """), {"batch": batch_id})
     print("   • updated star_schema.dim_traffic_source")
+
+    with warehouse_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO star_schema.dim_traffic_source
+              (traffic_source_key, traffic_source_id, name, channel)
+            SELECT
+              t.traffic_source_sk,
+              t.source_id,
+              t.name,
+              t.channel
+            FROM warehouse.traffic_sources AS t
+            LEFT JOIN star_schema.dim_traffic_source AS d
+              ON d.traffic_source_key = t.traffic_source_sk
+            WHERE t.end_date = '9999-12-31'::DATE
+              AND d.traffic_source_key IS NULL;
+        """))
+    print("   • inserted any missing star_schema.dim_traffic_source entries")
 
     #  2.4) dim_sales_manager – delete + re‐insert changed keys (explicit SK)
     with warehouse_engine.begin() as conn:

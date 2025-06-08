@@ -10,11 +10,11 @@ if PROJECT_ROOT not in sys.path:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Import the actual flow object
-from flows.etl_flows import initial_load_flow
+from flows.elt_flows import initial_load_flow
 
 if __name__ == "__main__":
     # ─────────────────────────────────────────────────────────────────────────
-    # 1) Compute the absolute path to etl_flows.py so Prefect knows where to
+    # 1) Compute the absolute path to elt_flows.py so Prefect knows where to
     #    upload your code. Without this, Prefect will complain:
     #      “Either an image or remote storage location must be provided…”
     #    (see: https://docs.prefect.io/api-ref/prefect/flows/flow/#prefect.flows.Flow.deploy)
@@ -22,10 +22,10 @@ if __name__ == "__main__":
     #    __file__ here is ".../BI_project.v2/flows/deploy_initial.py"
     # ─────────────────────────────────────────────────────────────────────────
     flows_dir = os.path.dirname(__file__)                      # e.g. "/Users/.../BI_project.v2/flows"
-    flow_path = os.path.join(flows_dir, "etl_flows.py")        # "/Users/.../BI_project.v2/flows/etl_flows.py"
+    flow_path = os.path.join(flows_dir, "elt_flows.py")        # "/Users/.../BI_project.v2/flows/elt_flows.py"
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 2) Deploy the “initial‐load” flow, pointing at our local etl_flows.py file:
+    # 2) Deploy the “initial‐load” flow, pointing at our local elt_flows.py file:
     #    By passing `path=flow_path`, Prefect knows where to pick up the flow code.
     # ─────────────────────────────────────────────────────────────────────────
     initial_load_flow.deploy(

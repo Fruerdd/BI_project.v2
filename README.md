@@ -181,7 +181,7 @@ Follow these steps to clone the repo, configure your environment, and run everyt
 1. **Run Full‐Load Command**  
    - Execute the full-load logic in `warehouse/etl.py` (batch_id = 1):
      ```bash
-     python warehouse/etl.py full
+     python warehouse/elt.py full
      ```
    - Expected console output:
      ```
@@ -223,12 +223,13 @@ import sys
 import os
 from datetime import date
 from prefect import flow, task
-from warehouse.etl import run_incremental_load
+from warehouse.elt import run_incremental_load
 from notifications.telegram import send_telegram_message
+
 
 @task(name="notify_start", retries=0, retry_delay_seconds=0, log_prints=True)
 def notify_start(batch_id: int):
-    token   = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     message = f"🚀 Starting incremental load for batch {batch_id}"
     try:
@@ -236,14 +237,16 @@ def notify_start(batch_id: int):
     except Exception as e:
         print(f"[notify_start] Telegram error: {e}")
 
+
 @task(name="incremental_load_task", retries=1, retry_delay_seconds=300, log_prints=True)
 def incremental_load(batch_id: int):
     run_incremental_load(batch_id)
     return f"Incremental load completed for batch {batch_id}"
 
+
 @task(name="notify_success", retries=0, retry_delay_seconds=0, log_prints=True)
 def notify_success(batch_id: int):
-    token   = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     message = f"✅ Incremental load succeeded for batch {batch_id}"
     try:
@@ -251,15 +254,17 @@ def notify_success(batch_id: int):
     except Exception as e:
         print(f"[notify_success] Telegram error: {e}")
 
+
 @task(name="notify_failure", retries=0, retry_delay_seconds=0, log_prints=True)
 def notify_failure(batch_id: int, error_msg: str):
-    token   = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     message = f"❌ Incremental load FAILED for batch {batch_id}\nError: {error_msg}"
     try:
         send_telegram_message(message, bot_token=token, chat_id=chat_id)
     except Exception as e:
         print(f"[notify_failure] Telegram error: {e}")
+
 
 @flow(name="incremental_load_flow")
 def incremental_load_flow(execution_date: date = date.today()):
@@ -277,10 +282,11 @@ def incremental_load_flow(execution_date: date = date.today()):
         notify_failure(batch_id, err)
         raise
 
+
 if __name__ == "__main__":
     incremental_load_flow.serve(
         name="incremental-load-every-5m",
-        interval=300,            # 5 minutes
+        interval=300,  # 5 minutes
         tags=["bi_project"],
         pause_on_shutdown=False,
     )

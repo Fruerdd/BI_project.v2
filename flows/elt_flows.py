@@ -1,4 +1,4 @@
-# File: flows/etl_flows.py
+# File: flows/elt_flows.py
 
 import sys
 import os
@@ -12,7 +12,7 @@ if PROJECT_ROOT not in sys.path:
 # ─────────────────────────────────────────────────────────────────────────────
 
 from prefect import flow, task
-from warehouse.etl import run_incremental_load
+from warehouse.elt import run_incremental_load
 from notifications.telegram import send_telegram_message
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,7 +101,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------
     incremental_load_flow.serve(
         name="incremental-load-every-5m",
-        interval=300,            # 300 seconds = 5 minutes
+        interval=300,
         tags=["bi_project"],
         pause_on_shutdown=False,
     )
